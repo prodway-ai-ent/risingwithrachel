@@ -15,8 +15,8 @@ concurrency:
 
 env:
   AWS_REGION: us-east-1
-  S3_BUCKET: risingwithrachel.com
-  CLOUDFRONT_DISTRIBUTION_ID: EWE99BTVJF99G
+  S3_BUCKET: rwr-site-794934876529
+  CLOUDFRONT_DISTRIBUTION_ID: E203DSZKL8HMTK
 
 jobs:
   build-and-deploy:
@@ -40,7 +40,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::272795262341:role/rwr-github-deploy
+          role-to-assume: arn:aws:iam::794934876529:role/rwr-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Sync static assets (long cache)
