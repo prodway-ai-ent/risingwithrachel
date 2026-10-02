@@ -54,14 +54,14 @@ async function signingKey(kid) {
 }
 
 async function verifyToken(token) {
-  if (!token || !COGNITO_USER_POOL_ID || !COGNITO_CLIENT_ID) return false;
+  if (!token || !COGNITO_USER_POOL_ID || !COGNITO_CLIENT_ID) return null;
   const parts = token.split(".");
-  if (parts.length !== 3) return false;
+  if (parts.length !== 3) return null;
   try {
     const header = JSON.parse(Buffer.from(parts[0], "base64url").toString());
     const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
     const jwk = await signingKey(header.kid);
-    if (!jwk || header.alg !== "RS256") return false;
+    if (!jwk || header.alg !== "RS256") return null;
     const key = crypto.createPublicKey({ key: jwk, format: "jwk" });
     const valid = crypto.verify(
       "RSA-SHA256",
@@ -69,14 +69,36 @@ async function verifyToken(token) {
       key,
       Buffer.from(parts[2], "base64url"),
     );
-    return valid
-      && payload.iss === ISSUER
-      && payload.aud === COGNITO_CLIENT_ID
-      && payload.token_use === "id"
-      && payload.exp * 1000 > Date.now();
+    if (!valid || payload.iss !== ISSUER || payload.aud !== COGNITO_CLIENT_ID || payload.token_use !== "id" || payload.exp * 1000 <= Date.now()) {
+      return null;
+    }
+    return payload;
   } catch {
-    return false;
+    return null;
   }
+}
+
+const textParam = (name, value) => ({
+  name,
+  value: value ? { stringValue: String(value) } : { isNull: true },
+});
+const longParam = (name, value) => ({ name, value: { longValue: Number(value) } });
+
+async function query(sql, parameters) {
+  const res = await execWithResume(new ExecuteStatementCommand({
+    resourceArn: CLUSTER_ARN,
+    secretArn: SECRET_ARN,
+    database: DB_NAME,
+    sql,
+    parameters,
+    formatRecordsAs: "JSON",
+  }));
+  return res.formattedRecords ? JSON.parse(res.formattedRecords) : [];
+}
+
+async function requireUser(event) {
+  const auth = event?.headers?.authorization || event?.headers?.Authorization || "";
+  return verifyToken(auth.replace(/^Bearer\s+/i, ""));
 }
 
 function authed(result) {
@@ -181,27 +203,95 @@ export const handler = async (event) => {
     return login(body);
   }
 
-  if (method === "GET" && path.endsWith("/submissions")) {
-    const auth = event?.headers?.authorization || event?.headers?.Authorization || "";
-    const token = auth.replace(/^Bearer\s+/i, "");
-    if (!(await verifyToken(token))) return json(401, { ok: false, error: "Unauthorized" });
+  const user = await requireUser(event);
+  if (!user) return json(401, { ok: false, error: "Unauthorized" });
 
-    try {
-      const res = await execWithResume(new ExecuteStatementCommand({
-        resourceArn: CLUSTER_ARN,
-        secretArn: SECRET_ARN,
-        database: DB_NAME,
-        sql: `SELECT id, created_at, name, email, phone, location, experience,
-                     preferred_contact, goals, message
-              FROM submissions ORDER BY created_at DESC LIMIT 500`,
-        formatRecordsAs: "JSON",
-      }));
-      const rows = res.formattedRecords ? JSON.parse(res.formattedRecords) : [];
+  const clientMatch = path.match(/\/clients\/(\d+)$/);
+
+  try {
+    if (method === "GET" && path.endsWith("/submissions")) {
+      const rows = await query(`SELECT id, created_at, name, email, phone, location, experience,
+                     preferred_contact, goals, message, client_id
+              FROM submissions ORDER BY created_at DESC LIMIT 500`);
       return json(200, { ok: true, submissions: rows });
-    } catch (err) {
-      console.error("Query failed:", err);
-      return json(500, { ok: false, error: "Query failed" });
     }
+
+    if (method === "GET" && clientMatch) {
+      const id = clientMatch[1];
+      const clients = await query(
+        `SELECT id, created_at, name, email, phone, location, notes
+         FROM clients WHERE id = :id`,
+        [longParam("id", id)],
+      );
+      if (!clients.length) return json(404, { ok: false, error: "Client not found." });
+      const submissions = await query(
+        `SELECT id, created_at, experience, goals, message
+         FROM submissions WHERE client_id = :id ORDER BY created_at DESC`,
+        [longParam("id", id)],
+      );
+      return json(200, { ok: true, client: clients[0], submissions });
+    }
+
+    if (method === "GET" && path.endsWith("/clients")) {
+      const rows = await query(`SELECT id, created_at, name, email, phone, location, notes
+              FROM clients ORDER BY created_at DESC LIMIT 500`);
+      return json(200, { ok: true, clients: rows });
+    }
+
+    if (method === "POST" && path.endsWith("/clients")) {
+      let body;
+      try { body = JSON.parse(event.body || "{}"); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
+      const name = String(body.name || "").trim();
+      const email = String(body.email || "").trim();
+      if (!name || !email) return json(400, { ok: false, error: "Name and email are required." });
+      if (body.submissionId) {
+        const existing = await query(
+          "SELECT client_id FROM submissions WHERE id = :id",
+          [longParam("id", body.submissionId)],
+        );
+        if (!existing.length) return json(404, { ok: false, error: "Inquiry not found." });
+        if (existing[0].client_id) {
+          return json(409, { ok: false, error: "This inquiry is already a client.", clientId: existing[0].client_id });
+        }
+      }
+      const created = await query(
+        `INSERT INTO clients (name, email, phone, location, notes, created_by)
+         VALUES (:name, :email, :phone, :location, :notes, :created_by)
+         RETURNING id, created_at, name, email, phone, location, notes`,
+        [
+          textParam("name", name),
+          textParam("email", email),
+          textParam("phone", body.phone),
+          textParam("location", body.location),
+          textParam("notes", body.notes),
+          textParam("created_by", user.email),
+        ],
+      );
+      if (body.submissionId) {
+        await query(
+          "UPDATE submissions SET client_id = :clientId, updated_at = now() WHERE id = :id AND client_id IS NULL",
+          [longParam("clientId", created[0].id), longParam("id", body.submissionId)],
+        );
+      }
+      return json(200, { ok: true, client: created[0] });
+    }
+
+    if (method === "PATCH" && clientMatch) {
+      let body;
+      try { body = JSON.parse(event.body || "{}"); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
+      const updated = await query(
+        `UPDATE clients
+         SET notes = :notes, updated_at = now()
+         WHERE id = :id
+         RETURNING id, created_at, name, email, phone, location, notes`,
+        [textParam("notes", body.notes), longParam("id", clientMatch[1])],
+      );
+      if (!updated.length) return json(404, { ok: false, error: "Client not found." });
+      return json(200, { ok: true, client: updated[0] });
+    }
+  } catch (err) {
+    console.error("Client request failed:", err);
+    return json(500, { ok: false, error: "Request failed" });
   }
 
   return json(404, { ok: false, error: "Not found" });
