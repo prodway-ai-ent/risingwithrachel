@@ -44,6 +44,11 @@
 .rwr-admin-login-card input:focus { border-color: var(--ember); box-shadow: 0 0 0 4px rgba(255, 106, 69, 0.18); }
 .rwr-admin-login-card input + input,
 .rwr-admin-login-card .rwr-admin-secret + input { margin-top: 10px; }
+.rwr-admin-login-card select,
+.rwr-admin-login-card input[type="datetime-local"] {
+  width: 100%; margin-top: 8px; border: 1px solid var(--line-2); border-radius: 12px;
+  padding: 12px 14px; background: var(--panel-2); color: var(--text); font: inherit;
+}
 .rwr-admin-secret {
   display: block; margin-top: 4px; padding: 10px 12px; border-radius: 10px;
   background: var(--panel-2); border: 1px solid var(--line);
