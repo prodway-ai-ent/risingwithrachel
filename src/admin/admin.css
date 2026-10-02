@@ -42,6 +42,13 @@
 }
 .rwr-admin-login-card input::placeholder, .rwr-admin-search::placeholder { color: #7d6f61; }
 .rwr-admin-login-card input:focus { border-color: var(--ember); box-shadow: 0 0 0 4px rgba(255, 106, 69, 0.18); }
+.rwr-admin-login-card input + input,
+.rwr-admin-login-card .rwr-admin-secret + input { margin-top: 10px; }
+.rwr-admin-secret {
+  display: block; margin-top: 4px; padding: 10px 12px; border-radius: 10px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  color: var(--text); font-size: 0.85rem; word-break: break-all; text-align: left;
+}
 .rwr-admin-login-card button {
   width: 100%; margin-top: 16px; border: 0; border-radius: 12px; padding: 13px 15px;
   font-weight: 700; color: #fff; background: var(--sunrise); cursor: pointer;
