@@ -91,7 +91,16 @@
   padding: 10px 13px; cursor: pointer; color: var(--muted);
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.rwr-admin-ghost:hover { background: var(--panel-2); color: var(--text); border-color: var(--ember); }
+.rwr-admin-ghost:hover, .rwr-admin-ghost.is-on { background: var(--panel-2); color: var(--text); border-color: var(--ember); }
+.rwr-admin-notes {
+  width: 100%; min-height: 120px; margin-top: 8px; resize: vertical;
+  border: 1px solid var(--line-2); border-radius: 12px; padding: 12px 14px;
+  background: var(--panel-2); color: var(--text); font: inherit;
+}
+.rwr-admin-drawer-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+.rwr-admin-drawer-actions .rwr-admin-reply { margin-top: 0; }
+.rwr-admin-reply.is-quiet { background: transparent; color: var(--text); border: 1px solid var(--line-2); box-shadow: none; }
+button.rwr-admin-reply { border: 0; cursor: pointer; }
 
 /* ---------- Stats ---------- */
 .rwr-admin-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 28px 28px 0; max-width: 980px; margin: 0 auto; }
@@ -154,7 +163,7 @@
 .rwr-admin-drawer h2 { font-family: 'Fraunces', serif; color: #fff; font-size: 1.5rem; margin: 0 0 2px; }
 .rwr-admin-detail { margin: 24px 0 0; }
 .rwr-admin-field { padding: 13px 0; border-top: 1px solid var(--line); }
-.rwr-admin-field dt { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 4px; }
+.rwr-admin-field dt, .rwr-admin-field > span { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 4px; }
 .rwr-admin-field dd { margin: 0; white-space: pre-wrap; line-height: 1.55; color: var(--text); }
 .rwr-admin-reply {
   display: inline-block; margin-top: 26px; background: var(--sunrise); color: #fff; text-decoration: none;

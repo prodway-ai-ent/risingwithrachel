@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Counter from '../components/Counter';
 import './admin.css';
@@ -14,6 +14,17 @@ type Submission = {
   preferred_contact?: string;
   goals?: string;
   message?: string;
+  client_id?: number | null;
+};
+
+type Client = {
+  id: number;
+  created_at: string;
+  name: string;
+  email: string;
+  phone?: string;
+  location?: string;
+  notes?: string;
 };
 
 const TOKEN_KEY = 'rwr_admin_token';
@@ -122,6 +133,11 @@ const Login: React.FC<{ onAuthed: (token: string) => void }> = ({ onAuthed }) =>
   );
 };
 
+const recentCount = (rows: { created_at: string }[]) => rows.reduce((count, row) => {
+  const d = new Date((row.created_at || '').replace(' ', 'T') + 'Z');
+  return count + (Date.now() - d.getTime() < 7 * 864e5 ? 1 : 0);
+}, 0);
+
 const formatDate = (s: string) => {
   const d = new Date(s.includes('T') || s.includes('Z') ? s : s.replace(' ', 'T') + 'Z');
   if (isNaN(d.getTime())) return s;
@@ -129,39 +145,108 @@ const formatDate = (s: string) => {
 };
 
 const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, onLogout }) => {
+  const [view, setView] = useState<'inquiries' | 'clients'>('inquiries');
   const [subs, setSubs] = useState<Submission[]>([]);
+  const [clients, setClients] = useState<Client[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Submission | null>(null);
+  const [client, setClient] = useState<Client | null>(null);
+  const [clientInquiries, setClientInquiries] = useState<Submission[]>([]);
+  const [notes, setNotes] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const api = useCallback(async (path: string, options: RequestInit = {}) => {
+    const res = await fetch(path, {
+      ...options,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...(options.headers || {}) },
+    });
+    if (res.status === 401) { onLogout(); throw new Error('Unauthorized'); }
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || 'Request failed');
+    return body;
+  }, [token, onLogout]);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch('/api/admin/submissions', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.status === 401) { onLogout(); return; }
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok || !body.ok) throw new Error(body.error || 'Failed to load');
-      setSubs(body.submissions || []);
+      const [inquiryBody, clientBody] = await Promise.all([
+        api('/api/admin/submissions'),
+        api('/api/admin/clients'),
+      ]);
+      setSubs(inquiryBody.submissions || []);
+      setClients(clientBody.clients || []);
     } catch (err: any) {
-      setError(err.message || 'Failed to load');
+      if (err.message !== 'Unauthorized') setError(err.message || 'Failed to load');
     } finally {
       setLoading(false);
     }
-  }, [token, onLogout]);
+  }, [api]);
 
   useEffect(() => { load(); }, [load]);
 
-  const filtered = useMemo(() => {
+  const openClient = async (id: number) => {
+    const body = await api(`/api/admin/clients/${id}`);
+    setSelected(null);
+    setClient(body.client);
+    setNotes(body.client.notes || '');
+    setClientInquiries(body.submissions || []);
+    setView('clients');
+  };
+
+  const createFromInquiry = async (inquiry: Submission) => {
+    setSaving(true);
+    setError('');
+    try {
+      const body = await api('/api/admin/clients', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: inquiry.name,
+          email: inquiry.email,
+          phone: inquiry.phone,
+          location: inquiry.location,
+          submissionId: inquiry.id,
+        }),
+      });
+      setSubs((rows) => rows.map((row) => row.id === inquiry.id ? { ...row, client_id: body.client.id } : row));
+      await openClient(body.client.id);
+      const clientBody = await api('/api/admin/clients');
+      setClients(clientBody.clients || []);
+    } catch (err: any) {
+      setError(err.message || 'Could not create client');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveNotes = async () => {
+    if (!client) return;
+    setSaving(true);
+    setError('');
+    try {
+      const body = await api(`/api/admin/clients/${client.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ notes }),
+      });
+      setClient(body.client);
+      setClients((rows) => rows.map((row) => row.id === body.client.id ? body.client : row));
+    } catch (err: any) {
+      setError(err.message || 'Could not save notes');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const matches = (values: Array<string | undefined>) => {
     const q = query.trim().toLowerCase();
-    if (!q) return subs;
-    return subs.filter((s) =>
-      [s.name, s.email, s.location, s.goals, s.message].filter(Boolean).join(' ').toLowerCase().includes(q)
-    );
-  }, [subs, query]);
+    if (!q) return true;
+    return values.filter(Boolean).join(' ').toLowerCase().includes(q);
+  };
+  const filteredInquiries = subs.filter((s) => matches([s.name, s.email, s.location, s.goals, s.message]));
+  const filteredClients = clients.filter((s) => matches([s.name, s.email, s.location, s.notes]));
+  const filtered: Array<Submission | Client> = view === 'clients' ? filteredClients : filteredInquiries;
 
   return (
     <div className="rwr-admin">
@@ -170,11 +255,13 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
           <span className="rwr-admin-logo sm">RR</span>
           <div>
             <strong>Rising with Rachel</strong>
-            <span>Client inquiries</span>
+            <span>{view === 'clients' ? 'Clients' : 'Client inquiries'}</span>
           </div>
         </div>
         <div className="rwr-admin-actions">
-          <input className="rwr-admin-search" placeholder="Search inquiries…" value={query} onChange={(e) => setQuery(e.target.value)} />
+          <button type="button" className={`rwr-admin-ghost${view === 'inquiries' ? ' is-on' : ''}`} onClick={() => { setView('inquiries'); setClient(null); }}>Inquiries</button>
+          <button type="button" className={`rwr-admin-ghost${view === 'clients' ? ' is-on' : ''}`} onClick={() => { setView('clients'); setSelected(null); }}>Clients</button>
+          <input className="rwr-admin-search" placeholder={view === 'clients' ? 'Search clients…' : 'Search inquiries…'} value={query} onChange={(e) => setQuery(e.target.value)} />
           <button className="rwr-admin-ghost" onClick={load} title="Refresh">↻</button>
           <button className="rwr-admin-ghost" onClick={onLogout}>Sign out</button>
         </div>
@@ -182,42 +269,38 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
 
       <div className="rwr-admin-stats">
         <motion.div className="rwr-admin-stat" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
-          <Counter className="rwr-admin-stat-num" to={subs.length} />
-          <span className="rwr-admin-stat-label">Total inquiries</span>
+          <Counter className="rwr-admin-stat-num" to={view === 'clients' ? clients.length : subs.length} />
+          <span className="rwr-admin-stat-label">{view === 'clients' ? 'Clients' : 'Total inquiries'}</span>
         </motion.div>
         <motion.div className="rwr-admin-stat" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }}>
           <Counter
             className="rwr-admin-stat-num"
-            to={subs.filter((s) => {
-              const d = new Date((s.created_at || '').replace(' ', 'T') + 'Z');
-              return Date.now() - d.getTime() < 7 * 864e5;
-            }).length}
+            to={view === 'clients' ? recentCount(clients) : recentCount(subs)}
           />
           <span className="rwr-admin-stat-label">Last 7 days</span>
         </motion.div>
       </div>
 
       <main className="rwr-admin-main">
+        {error && !loading && <div className="rwr-admin-empty">{error}</div>}
         {loading ? (
           <div className="rwr-admin-skeletons">
             {Array.from({ length: 5 }).map((_, i) => <div key={i} className="rwr-admin-skeleton" />)}
           </div>
-        ) : error ? (
-          <div className="rwr-admin-empty">{error}</div>
         ) : filtered.length === 0 ? (
-          <div className="rwr-admin-empty">No inquiries yet.</div>
+          <div className="rwr-admin-empty">{view === 'clients' ? 'No clients yet.' : 'No inquiries yet.'}</div>
         ) : (
           <motion.ul className="rwr-admin-list" initial="hidden" animate="show"
             variants={{ hidden: {}, show: { transition: { staggerChildren: 0.04 } } }}>
             <AnimatePresence>
               {filtered.map((s) => (
                 <motion.li
-                  key={s.id}
+                  key={`${view}-${s.id}`}
                   layout
                   variants={{ hidden: { opacity: 0, y: 12 }, show: { opacity: 1, y: 0 } }}
                   whileHover={{ scale: 1.008 }}
                   className="rwr-admin-row"
-                  onClick={() => setSelected(s)}
+                  onClick={() => view === 'clients' ? openClient(Number(s.id)) : setSelected(s as Submission)}
                 >
                   <div className="rwr-admin-avatar">{(s.name || '?').charAt(0).toUpperCase()}</div>
                   <div className="rwr-admin-row-main">
@@ -227,7 +310,8 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
                     </div>
                     <div className="rwr-admin-row-sub">
                       <span>{s.email}</span>
-                      {s.experience && <span className="rwr-admin-chip">{s.experience}</span>}
+                      {'experience' in s && s.experience && <span className="rwr-admin-chip">{s.experience}</span>}
+                      {'client_id' in s && s.client_id && <span className="rwr-admin-chip">Client</span>}
                       {s.location && <span className="rwr-admin-muted">{s.location}</span>}
                     </div>
                   </div>
@@ -259,7 +343,51 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
                 <Field label="Goals" value={selected.goals} />
                 <Field label="Message" value={selected.message} />
               </dl>
-              <a className="rwr-admin-reply" href={`mailto:${selected.email}`}>Reply by email</a>
+              <div className="rwr-admin-drawer-actions">
+                {selected.client_id ? (
+                  <button type="button" className="rwr-admin-reply" onClick={() => openClient(Number(selected.client_id))}>View client</button>
+                ) : (
+                  <button type="button" className="rwr-admin-reply" disabled={saving} onClick={() => createFromInquiry(selected)}>
+                    {saving ? 'Saving…' : 'Create client'}
+                  </button>
+                )}
+                <a className="rwr-admin-reply is-quiet" href={`mailto:${selected.email}`}>Reply by email</a>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {client && (
+          <motion.div className="rwr-admin-overlay" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            onClick={() => setClient(null)}>
+            <motion.div className="rwr-admin-drawer"
+              initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }}
+              transition={{ type: 'spring', stiffness: 320, damping: 32 }}
+              onClick={(e) => e.stopPropagation()}>
+              <button className="rwr-admin-close" onClick={() => setClient(null)}>×</button>
+              <div className="rwr-admin-avatar lg">{(client.name || '?').charAt(0).toUpperCase()}</div>
+              <h2>{client.name}</h2>
+              <span className="rwr-admin-date">{formatDate(client.created_at)}</span>
+              <dl className="rwr-admin-detail">
+                <Field label="Email" value={client.email} />
+                <Field label="Phone" value={client.phone} />
+                <Field label="Location" value={client.location} />
+              </dl>
+              <label className="rwr-admin-field">
+                <span>Notes</span>
+                <textarea className="rwr-admin-notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
+              </label>
+              <button type="button" className="rwr-admin-reply" disabled={saving} onClick={saveNotes}>
+                {saving ? 'Saving…' : 'Save notes'}
+              </button>
+              {clientInquiries.length > 0 && (
+                <div className="rwr-admin-detail">
+                  {clientInquiries.map((inquiry) => (
+                    <Field key={inquiry.id} label={formatDate(inquiry.created_at)} value={inquiry.goals || inquiry.message || inquiry.experience} />
+                  ))}
+                </div>
+              )}
             </motion.div>
           </motion.div>
         )}
