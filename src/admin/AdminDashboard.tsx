@@ -27,6 +27,14 @@ type Client = {
   notes?: string;
 };
 
+type Session = {
+  id: number;
+  starts_at: string;
+  ends_at: string;
+  status: string;
+  calendar_sync_status?: string;
+};
+
 const TOKEN_KEY = 'rwr_admin_token';
 type LoginStep = 'password' | 'new_password' | 'mfa_setup' | 'totp';
 
@@ -155,6 +163,10 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
   const [client, setClient] = useState<Client | null>(null);
   const [clientInquiries, setClientInquiries] = useState<Submission[]>([]);
   const [notes, setNotes] = useState('');
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [hoursLabel, setHoursLabel] = useState('Monday through Friday, 9 AM to 5 PM Central');
+  const [startsAt, setStartsAt] = useState('');
+  const [duration, setDuration] = useState('60');
   const [saving, setSaving] = useState(false);
 
   const api = useCallback(async (path: string, options: RequestInit = {}) => {
@@ -193,6 +205,8 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
     setClient(body.client);
     setNotes(body.client.notes || '');
     setClientInquiries(body.submissions || []);
+    setSessions(body.sessions || []);
+    setHoursLabel(body.availabilityLabel || hoursLabel);
     setView('clients');
   };
 
@@ -216,6 +230,44 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
       setClients(clientBody.clients || []);
     } catch (err: any) {
       setError(err.message || 'Could not create client');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const calendarNote = (status?: string) => {
+    if (status === 'synced') return 'On Google Calendar';
+    if (status === 'error') return 'Calendar sync needs attention';
+    return 'Waiting for Google Calendar credentials';
+  };
+
+  const bookSession = async () => {
+    if (!client) return;
+    setSaving(true);
+    setError('');
+    try {
+      const body = await api('/api/admin/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ clientId: client.id, startsAt, durationMinutes: Number(duration) }),
+      });
+      setSessions((rows) => [...rows, body.session].sort((a, b) => a.starts_at.localeCompare(b.starts_at)));
+      setStartsAt('');
+      if (body.emailError) setError(body.emailError);
+    } catch (err: any) {
+      setError(err.message || 'Could not book the session');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const cancelSession = async (id: number) => {
+    setSaving(true);
+    setError('');
+    try {
+      await api(`/api/admin/sessions/${id}/cancel`, { method: 'POST' });
+      setSessions((rows) => rows.filter((row) => row.id !== id));
+    } catch (err: any) {
+      setError(err.message || 'Could not cancel the session');
     } finally {
       setSaving(false);
     }
@@ -381,6 +433,37 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
               <button type="button" className="rwr-admin-reply" disabled={saving} onClick={saveNotes}>
                 {saving ? 'Saving…' : 'Save notes'}
               </button>
+              <div className="rwr-admin-detail">
+                <div className="rwr-admin-field">
+                  <span>Sessions</span>
+                  <p className="rwr-admin-muted">{hoursLabel}</p>
+                  {sessions.map((session) => (
+                    <div key={session.id} className="rwr-admin-session">
+                      <div>
+                        <strong>{formatDate(session.starts_at)}</strong>
+                        <span className="rwr-admin-muted">{calendarNote(session.calendar_sync_status)}</span>
+                      </div>
+                      <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => cancelSession(session.id)}>Cancel</button>
+                    </div>
+                  ))}
+                  <label className="rwr-admin-field">
+                    <span>Start, Central time</span>
+                    <input type="datetime-local" value={startsAt} onChange={(e) => setStartsAt(e.target.value)} />
+                  </label>
+                  <label className="rwr-admin-field">
+                    <span>Length</span>
+                    <select value={duration} onChange={(e) => setDuration(e.target.value)}>
+                      <option value="30">30 minutes</option>
+                      <option value="45">45 minutes</option>
+                      <option value="60">60 minutes</option>
+                      <option value="90">90 minutes</option>
+                    </select>
+                  </label>
+                  <button type="button" className="rwr-admin-reply" disabled={saving || !startsAt} onClick={bookSession}>
+                    {saving ? 'Saving…' : 'Book session'}
+                  </button>
+                </div>
+              </div>
               {clientInquiries.length > 0 && (
                 <div className="rwr-admin-detail">
                   {clientInquiries.map((inquiry) => (
