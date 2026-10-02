@@ -17,9 +17,15 @@ type Submission = {
 };
 
 const TOKEN_KEY = 'rwr_admin_token';
+type LoginStep = 'password' | 'new_password' | 'mfa_setup' | 'totp';
 
 const Login: React.FC<{ onAuthed: (token: string) => void }> = ({ onAuthed }) => {
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [nextValue, setNextValue] = useState('');
+  const [step, setStep] = useState<LoginStep>('password');
+  const [session, setSession] = useState('');
+  const [secret, setSecret] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -27,22 +33,47 @@ const Login: React.FC<{ onAuthed: (token: string) => void }> = ({ onAuthed }) =>
     e.preventDefault();
     setLoading(true);
     setError('');
+    const payload = step === 'password'
+      ? { email, password }
+      : step === 'new_password'
+        ? { email, session, challenge: 'NEW_PASSWORD', newPassword: nextValue }
+        : { email, session, challenge: step === 'mfa_setup' ? 'MFA_SETUP' : 'SOFTWARE_TOKEN_MFA', code: nextValue };
     try {
       const res = await fetch('/api/admin/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify(payload),
       });
       const body = await res.json().catch(() => ({}));
-      if (!res.ok || !body.ok) throw new Error(body.error || 'Login failed');
-      sessionStorage.setItem(TOKEN_KEY, body.token);
-      onAuthed(body.token);
+      if (!res.ok || body.ok === false) throw new Error(body.error || 'Login failed');
+      if (body.token) {
+        sessionStorage.setItem(TOKEN_KEY, body.token);
+        onAuthed(body.token);
+        return;
+      }
+      setSession(body.session || '');
+      setSecret(body.secret || '');
+      setNextValue('');
+      if (body.challenge === 'NEW_PASSWORD') setStep('new_password');
+      else if (body.challenge === 'MFA_SETUP') setStep('mfa_setup');
+      else setStep('totp');
     } catch (err: any) {
       setError(err.message || 'Login failed');
     } finally {
       setLoading(false);
     }
   };
+
+  const prompt = step === 'new_password'
+    ? 'Choose a new password'
+    : step === 'mfa_setup'
+      ? 'Add this key to an authenticator app, then enter the 6-digit code.'
+      : step === 'totp'
+        ? 'Enter the code from your authenticator app.'
+        : 'Admin dashboard';
+  const canSubmit = step === 'password'
+    ? Boolean(email && password)
+    : Boolean(nextValue);
 
   return (
     <div className="rwr-admin-login">
@@ -55,14 +86,22 @@ const Login: React.FC<{ onAuthed: (token: string) => void }> = ({ onAuthed }) =>
       >
         <div className="rwr-admin-logo">RR</div>
         <h1>Rising with Rachel</h1>
-        <p>Admin dashboard</p>
-        <input
-          type="password"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          autoFocus
-        />
+        <p>{prompt}</p>
+        {step === 'password' && (
+          <>
+            <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus autoComplete="username" />
+            <input type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+          </>
+        )}
+        {step === 'new_password' && (
+          <input type="password" placeholder="New password" value={nextValue} onChange={(e) => setNextValue(e.target.value)} autoFocus autoComplete="new-password" />
+        )}
+        {(step === 'mfa_setup' || step === 'totp') && (
+          <>
+            {step === 'mfa_setup' && secret && <code className="rwr-admin-secret">{secret}</code>}
+            <input inputMode="numeric" autoComplete="one-time-code" placeholder="6-digit code" value={nextValue} onChange={(e) => setNextValue(e.target.value)} autoFocus />
+          </>
+        )}
         <AnimatePresence>
           {error && (
             <motion.div
@@ -75,7 +114,7 @@ const Login: React.FC<{ onAuthed: (token: string) => void }> = ({ onAuthed }) =>
             </motion.div>
           )}
         </AnimatePresence>
-        <button type="submit" disabled={loading || !password}>
+        <button type="submit" disabled={loading || !canSubmit}>
           {loading ? 'Signing in…' : 'Sign in'}
         </button>
       </motion.form>
