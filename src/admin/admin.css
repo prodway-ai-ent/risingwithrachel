@@ -101,6 +101,16 @@
 .rwr-admin-drawer-actions .rwr-admin-reply { margin-top: 0; }
 .rwr-admin-reply.is-quiet { background: transparent; color: var(--text); border: 1px solid var(--line-2); box-shadow: none; }
 button.rwr-admin-reply { border: 0; cursor: pointer; }
+.rwr-admin-drawer input,
+.rwr-admin-drawer select {
+  width: 100%; margin-top: 8px; border: 1px solid var(--line-2); border-radius: 12px;
+  padding: 12px 14px; background: var(--panel-2); color: var(--text); font: inherit;
+}
+.rwr-admin-session {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-top: 12px;
+}
+.rwr-admin-session .rwr-admin-muted { display: block; margin-top: 2px; }
 
 /* ---------- Stats ---------- */
 .rwr-admin-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 28px 28px 0; max-width: 980px; margin: 0 auto; }
