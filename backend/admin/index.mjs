@@ -36,9 +36,12 @@ const {
   COGNITO_USER_POOL_ID,
   COGNITO_CLIENT_ID,
   GOOGLE_CALENDAR_SECRET_ARN,
+  STRIPE_SECRET_ARN,
   FROM_ADDRESS,
   NOTIFY_ADDRESS,
 } = process.env;
+
+const SITE = "https://risingwithrachel.com";
 
 const ISSUER = `https://cognito-idp.us-east-1.amazonaws.com/${COGNITO_USER_POOL_ID}`;
 const CORS = {
@@ -340,6 +343,22 @@ async function syncCalendar(action, session, client, rule) {
   const token = await googleAccessToken(secret);
   const calendarId = encodeURIComponent(secret.calendar_id || "primary");
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  if (action === "update" && session.google_event_id) {
+    const res = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(session.google_event_id)}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          start: { dateTime: session.starts_at, timeZone: rule.timezone },
+          end: { dateTime: session.ends_at, timeZone: rule.timezone },
+        }),
+      },
+    );
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.error?.message || "Could not update the Google Calendar event");
+    return { status: "synced", eventId: session.google_event_id, error: null };
+  }
   if (action === "delete") {
     if (!session.google_event_id) return { status: "cancelled", eventId: null, error: null };
     const res = await fetch(
@@ -385,9 +404,8 @@ async function writeCalendarResult(id, result) {
   return rows[0];
 }
 
-async function sendConfirmation(client, start, rule) {
-  if (!FROM_ADDRESS || !client.email) return { emailSent: false, emailError: "Confirmation email is not configured." };
-  const when = new Intl.DateTimeFormat("en-US", {
+function whenLabel(start, rule) {
+  return new Intl.DateTimeFormat("en-US", {
     timeZone: rule.timezone,
     weekday: "long",
     month: "long",
@@ -397,26 +415,27 @@ async function sendConfirmation(client, start, rule) {
     minute: "2-digit",
     timeZoneName: "short",
   }).format(start);
-  const html = `
-    <div style="font-family:Arial,sans-serif;max-width:560px;color:#111">
-      <h2 style="color:#2563eb">Your session is confirmed</h2>
-      <p>Hi ${esc(String(client.name).split(" ")[0])},</p>
-      <p>Your coaching session with Rachel is booked for <strong>${esc(when)}</strong>.</p>
-      <p style="margin-top:24px">Rachel<br/><span style="color:#888">Rising with Rachel</span></p>
-    </div>`;
+}
+
+function manageLink(token) {
+  return `${SITE}/session/${token}`;
+}
+
+async function sendMail(to, subject, html) {
+  if (!FROM_ADDRESS || !to) return { emailSent: false, emailError: "Confirmation email is not configured." };
   try {
     await ses.send(new SendEmailCommand({
       FromEmailAddress: `Rising with Rachel <${FROM_ADDRESS}>`,
-      Destination: { ToAddresses: [client.email] },
+      Destination: { ToAddresses: [to] },
       ReplyToAddresses: [NOTIFY_ADDRESS || FROM_ADDRESS],
       Content: { Simple: {
-        Subject: { Data: "Your session with Rising with Rachel is confirmed" },
+        Subject: { Data: subject },
         Body: { Html: { Data: html } },
       } },
     }));
     return { emailSent: true };
   } catch (err) {
-    console.error("Session confirmation failed:", err);
+    console.error("Session email failed:", err);
     const sandbox = err?.name === "MessageRejected";
     return {
       emailSent: false,
@@ -427,44 +446,79 @@ async function sendConfirmation(client, start, rule) {
   }
 }
 
+function sessionLetter(firstName, when, intro, token) {
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:560px;color:#111">
+      <h2 style="color:#2563eb">${esc(intro)}</h2>
+      <p>Hi ${esc(firstName)},</p>
+      <p>Your coaching session with Rachel is booked for <strong>${esc(when)}</strong>.</p>
+      <p><a href="${esc(manageLink(token))}">Change or cancel this session</a></p>
+      <p style="margin-top:24px">Rachel<br/><span style="color:#888">Rising with Rachel</span></p>
+    </div>`;
+}
+
+async function sendConfirmation(client, start, rule, token) {
+  const first = String(client.name || "").split(" ")[0];
+  return sendMail(
+    client.email,
+    "Your session with Rising with Rachel is confirmed",
+    sessionLetter(first, whenLabel(start, rule), "Your session is confirmed", token),
+  );
+}
+
 const SESSION_COLUMNS = "id, client_id, starts_at, ends_at, status, calendar_sync_status, google_event_id";
+
+async function planSession(startsAt, durationMinutes, excludeId) {
+  const duration = Number(durationMinutes);
+  if (!DURATIONS.has(duration)) return { error: json(400, { ok: false, error: "Choose a 30, 45, 60, or 90 minute session." }) };
+  const rule = await loadAvailability();
+  const start = utcFromLocal(startsAt, rule.timezone);
+  if (!start) return { error: json(400, { ok: false, error: "Enter a valid start time." }) };
+  if (start.getTime() <= Date.now()) return { error: json(400, { ok: false, error: "Choose a start time in the future." }) };
+  const end = new Date(start.getTime() + duration * 60 * 1000);
+  if (!withinHours(start, end, rule)) {
+    return { error: json(400, { ok: false, error: `Sessions are ${availabilityLabel(rule)}.` }) };
+  }
+  const parameters = [textParam("ends", end.toISOString()), textParam("starts", start.toISOString())];
+  let exclude = "";
+  if (excludeId) {
+    exclude = " AND id <> :excludeId";
+    parameters.push(longParam("excludeId", excludeId));
+  }
+  const overlap = await query(
+    `SELECT id FROM sessions
+     WHERE status = 'scheduled' AND starts_at < CAST(:ends AS timestamptz) AND ends_at > CAST(:starts AS timestamptz)${exclude}
+     LIMIT 1`,
+    parameters,
+  );
+  if (overlap.length) return { error: json(409, { ok: false, error: "That time overlaps another session." }) };
+  return { start, end, rule };
+}
 
 async function bookSession(body, user) {
   if (!body.clientId) return json(400, { ok: false, error: "Choose a client." });
-  const duration = Number(body.durationMinutes);
-  if (!DURATIONS.has(duration)) return json(400, { ok: false, error: "Choose a 30, 45, 60, or 90 minute session." });
-  const rule = await loadAvailability();
-  const start = utcFromLocal(body.startsAt, rule.timezone);
-  if (!start) return json(400, { ok: false, error: "Enter a valid start time." });
-  if (start.getTime() <= Date.now()) return json(400, { ok: false, error: "Choose a start time in the future." });
-  const end = new Date(start.getTime() + duration * 60 * 1000);
-  if (!withinHours(start, end, rule)) {
-    return json(400, { ok: false, error: `Sessions are ${availabilityLabel(rule)}.` });
-  }
+  const plan = await planSession(body.startsAt, body.durationMinutes);
+  if (plan.error) return plan.error;
+  const { start, end, rule } = plan;
   const clients = await query(
     "SELECT id, name, email FROM clients WHERE id = :id",
     [longParam("id", body.clientId)],
   );
   if (!clients.length) return json(404, { ok: false, error: "Client not found." });
-  const overlap = await query(
-    `SELECT id FROM sessions
-     WHERE status = 'scheduled' AND starts_at < CAST(:ends AS timestamptz) AND ends_at > CAST(:starts AS timestamptz)
-     LIMIT 1`,
-    [textParam("ends", end.toISOString()), textParam("starts", start.toISOString())],
-  );
-  if (overlap.length) return json(409, { ok: false, error: "That time overlaps another session." });
+  const manageToken = crypto.randomBytes(24).toString("base64url");
   const created = await query(
-    `INSERT INTO sessions (client_id, starts_at, ends_at, created_by, calendar_sync_status)
-     VALUES (:clientId, CAST(:starts AS timestamptz), CAST(:ends AS timestamptz), :created_by, 'pending')
+    `INSERT INTO sessions (client_id, starts_at, ends_at, created_by, calendar_sync_status, manage_token)
+     VALUES (:clientId, CAST(:starts AS timestamptz), CAST(:ends AS timestamptz), :created_by, 'pending', :token)
      RETURNING ${SESSION_COLUMNS}`,
     [
       longParam("clientId", body.clientId),
       textParam("starts", start.toISOString()),
       textParam("ends", end.toISOString()),
       textParam("created_by", user.email),
+      textParam("token", manageToken),
     ],
   );
-  const mail = await sendConfirmation(clients[0], start, rule);
+  const mail = await sendConfirmation(clients[0], start, rule, manageToken);
   let session = created[0];
   try {
     const synced = await syncCalendar("create", {
@@ -515,10 +569,249 @@ async function cancelSession(id) {
   return json(200, { ok: true, session });
 }
 
+async function sessionByToken(token) {
+  const rows = await query(
+    `SELECT s.id, s.client_id, s.starts_at, s.ends_at, s.status, s.manage_token, s.google_event_id, s.calendar_sync_status,
+            c.name, c.email
+     FROM sessions s JOIN clients c ON c.id = s.client_id
+     WHERE s.manage_token = :token`,
+    [textParam("token", token)],
+  );
+  return rows[0] || null;
+}
+
+function publicSession(row, rule) {
+  return json(200, {
+    ok: true,
+    session: { status: row.status, starts_at: row.starts_at, ends_at: row.ends_at, name: row.name },
+    availabilityLabel: availabilityLabel(rule),
+  });
+}
+
+async function manageSession(token, action, body) {
+  const row = await sessionByToken(token);
+  if (!row) return json(400, { ok: false, error: "This link is not valid." });
+  const rule = await loadAvailability();
+  if (action === "get") return publicSession(row, rule);
+  const starts = new Date(String(row.starts_at).includes("T") ? row.starts_at : String(row.starts_at).replace(" ", "T") + "Z");
+  if (row.status !== "scheduled" || starts.getTime() <= Date.now()) {
+    return json(400, { ok: false, error: "This session can no longer be changed." });
+  }
+  if (action === "cancel") {
+    const result = await cancelSession(row.id);
+    const first = String(row.name).split(" ")[0];
+    await sendMail(row.email, "Your session with Rising with Rachel was cancelled", `
+      <div style="font-family:Arial,sans-serif;max-width:560px;color:#111">
+        <p>Hi ${esc(first)},</p>
+        <p>Your coaching session has been cancelled.</p>
+        <p style="margin-top:24px">Rachel<br/><span style="color:#888">Rising with Rachel</span></p>
+      </div>`);
+    const parsed = JSON.parse(result.body);
+    return json(result.statusCode, { ...parsed, notice: "This session is cancelled." });
+  }
+  const plan = await planSession(body.startsAt, body.durationMinutes, row.id);
+  if (plan.error) return plan.error;
+  const updated = await query(
+    `UPDATE sessions
+     SET starts_at = CAST(:starts AS timestamptz), ends_at = CAST(:ends AS timestamptz),
+         reminder_24h_sent_at = NULL, reminder_1h_sent_at = NULL, updated_at = now()
+     WHERE id = :id
+     RETURNING ${SESSION_COLUMNS}, manage_token`,
+    [
+      textParam("starts", plan.start.toISOString()),
+      textParam("ends", plan.end.toISOString()),
+      longParam("id", row.id),
+    ],
+  );
+  try {
+    const synced = await syncCalendar("update", {
+      ...updated[0],
+      google_event_id: row.google_event_id,
+      starts_at: plan.start.toISOString(),
+      ends_at: plan.end.toISOString(),
+    }, row, plan.rule);
+    if (synced.status !== "pending_credentials") await writeCalendarResult(row.id, synced);
+  } catch (err) {
+    console.error("Calendar update failed:", err);
+    await writeCalendarResult(row.id, {
+      status: "error",
+      eventId: row.google_event_id,
+      error: "Google Calendar did not accept the new time.",
+    });
+  }
+  const first = String(row.name).split(" ")[0];
+  await sendMail(
+    row.email,
+    "Your session with Rising with Rachel was rescheduled",
+    sessionLetter(first, whenLabel(plan.start, plan.rule), "Your session was rescheduled", row.manage_token),
+  );
+  return json(200, { ...(JSON.parse(publicSession(updated[0], plan.rule).body)), notice: "Your session was rescheduled." });
+}
+
+async function sendReminders() {
+  const rule = await loadAvailability();
+  const due = await query(
+    `SELECT s.id, s.starts_at, s.manage_token, s.reminder_24h_sent_at, s.reminder_1h_sent_at, c.name, c.email
+     FROM sessions s JOIN clients c ON c.id = s.client_id
+     WHERE s.status = 'scheduled' AND s.starts_at > now() AND (
+       (s.reminder_1h_sent_at IS NULL AND s.starts_at <= now() + interval '75 minutes' AND s.starts_at > now() + interval '30 minutes')
+       OR (s.reminder_24h_sent_at IS NULL AND s.starts_at <= now() + interval '25 hours' AND s.starts_at > now() + interval '22 hours')
+     )`,
+  );
+  let sent = 0;
+  for (const row of due) {
+    const start = new Date(String(row.starts_at).includes("T") ? row.starts_at : String(row.starts_at).replace(" ", "T") + "Z");
+    const soon = start.getTime() - Date.now() <= 75 * 60 * 1000;
+    const kind = soon ? "1h" : "24h";
+    const subject = soon
+      ? "Your session with Rachel starts in about an hour"
+      : "Your session with Rachel is coming up";
+    const intro = soon ? "Your session starts in about an hour" : "Your session is coming up";
+    const mail = await sendMail(
+      row.email,
+      subject,
+      sessionLetter(String(row.name).split(" ")[0], whenLabel(start, rule), intro, row.manage_token),
+    );
+    if (!mail.emailSent) continue;
+    sent += 1;
+    const column = kind === "1h" ? "reminder_1h_sent_at" : "reminder_24h_sent_at";
+    await query(`UPDATE sessions SET ${column} = now(), updated_at = now() WHERE id = :id`, [longParam("id", row.id)]);
+  }
+  return { ok: true, due: due.length, sent };
+}
+
+let stripeSecretCache;
+async function loadStripeSecret() {
+  if (stripeSecretCache) return stripeSecretCache;
+  if (!STRIPE_SECRET_ARN) return null;
+  const out = await secrets.send(new GetSecretValueCommand({ SecretId: STRIPE_SECRET_ARN }));
+  stripeSecretCache = JSON.parse(out.SecretString || "{}");
+  return stripeSecretCache;
+}
+
+function stripeReady(secret) {
+  if (!secret) return false;
+  return ["secret_key", "publishable_key", "webhook_secret"].every((key) => {
+    const value = String(secret[key] || "");
+    return value && !value.startsWith("dummy");
+  });
+}
+
+function stripeSignatureValid(payload, header, secret) {
+  if (!header || !secret) return false;
+  const parts = Object.fromEntries(String(header).split(",").map((part) => {
+    const index = part.indexOf("=");
+    return [part.slice(0, index), part.slice(index + 1)];
+  }));
+  if (!parts.t || !parts.v1) return false;
+  if (Math.abs(Date.now() / 1000 - Number(parts.t)) > 300) return false;
+  const expected = crypto.createHmac("sha256", secret).update(`${parts.t}.${payload}`).digest("hex");
+  const given = parts.v1;
+  if (expected.length !== given.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(given));
+}
+
+async function stripeWebhook(event) {
+  const secret = await loadStripeSecret();
+  if (!stripeReady(secret)) return json(404, { ok: false, error: "Not found" });
+  const payload = event.isBase64Encoded ? Buffer.from(event.body || "", "base64").toString("utf8") : (event.body || "");
+  const header = event.headers?.["stripe-signature"] || event.headers?.["Stripe-Signature"] || "";
+  if (!stripeSignatureValid(payload, header, secret.webhook_secret)) {
+    return json(400, { ok: false, error: "Invalid signature" });
+  }
+  let body;
+  try { body = JSON.parse(payload); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
+  if (body.type !== "checkout.session.completed" && body.type !== "charge.refunded") {
+    return json(200, { ok: true });
+  }
+  const object = body.data?.object || {};
+  const email = object.customer_details?.email || object.billing_details?.email || object.receipt_email || "";
+  const clients = email
+    ? await query("SELECT id FROM clients WHERE lower(email) = lower(:email) LIMIT 1", [textParam("email", email)])
+    : [];
+  const amount = object.amount_total ?? object.amount_refunded ?? object.amount ?? null;
+  await query(
+    `INSERT INTO payments (client_id, stripe_event_id, stripe_object_id, amount_cents, currency, status, created_by)
+     VALUES (CAST(:clientId AS bigint), :eventId, :objectId, CAST(:amount AS integer), :currency, :status, 'stripe')
+     ON CONFLICT (stripe_event_id) DO NOTHING`,
+    [
+      clients[0] ? longParam("clientId", clients[0].id) : textParam("clientId", null),
+      textParam("eventId", body.id),
+      textParam("objectId", object.id),
+      amount == null ? textParam("amount", null) : longParam("amount", amount),
+      textParam("currency", object.currency),
+      textParam("status", body.type),
+    ],
+  );
+  return json(200, { ok: true });
+}
+
+function csvCell(value) {
+  const text = value == null ? "" : String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+async function exportCsv() {
+  const clients = await query("SELECT id, name, email, phone, location, notes, created_at FROM clients ORDER BY id");
+  const sessions = await query("SELECT id, client_id, starts_at, ends_at, status FROM sessions ORDER BY starts_at");
+  const lines = [["record", "id", "client_id", "name", "email", "phone", "location", "notes", "starts_at", "ends_at", "status"].join(",")];
+  for (const row of clients) {
+    lines.push(["client", row.id, "", row.name, row.email, row.phone, row.location, row.notes, "", "", ""].map(csvCell).join(","));
+  }
+  for (const row of sessions) {
+    lines.push(["session", row.id, row.client_id, "", "", "", "", "", row.starts_at, row.ends_at, row.status].map(csvCell).join(","));
+  }
+  return {
+    statusCode: 200,
+    headers: {
+      ...CORS,
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": 'attachment; filename="rising-with-rachel.csv"',
+    },
+    body: `${lines.join("\n")}\n`,
+  };
+}
+
 export const handler = async (event) => {
   const method = event?.requestContext?.http?.method;
   const path = event?.requestContext?.http?.path || event?.rawPath || "";
+  if (event?.source === "aws.events") {
+    try {
+      return { statusCode: 200, body: JSON.stringify(await sendReminders()) };
+    } catch (err) {
+      console.error("Reminders failed:", err);
+      return { statusCode: 500, body: JSON.stringify({ ok: false }) };
+    }
+  }
+
   if (method === "OPTIONS") return json(200, { ok: true });
+
+  if (method === "POST" && path.endsWith("/stripe/webhook")) {
+    try {
+      return await stripeWebhook(event);
+    } catch (err) {
+      console.error("Stripe webhook failed:", err);
+      return json(500, { ok: false, error: "Request failed" });
+    }
+  }
+
+  const manageCancel = path.match(/\/session\/([A-Za-z0-9_-]+)\/cancel$/);
+  const manageReschedule = path.match(/\/session\/([A-Za-z0-9_-]+)\/reschedule$/);
+  const manageGet = path.match(/\/session\/([A-Za-z0-9_-]+)$/);
+  if ((method === "POST" && manageCancel) || (method === "POST" && manageReschedule) || (method === "GET" && manageGet)) {
+    let body = {};
+    if (method === "POST") {
+      try { body = JSON.parse(event.body || "{}"); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
+    }
+    const token = (manageCancel || manageReschedule || manageGet)[1];
+    const action = manageCancel ? "cancel" : manageReschedule ? "reschedule" : "get";
+    try {
+      return await manageSession(token, action, body);
+    } catch (err) {
+      console.error("Session link failed:", err);
+      return json(500, { ok: false, error: "Request failed" });
+    }
+  }
 
   if (method === "POST" && path.endsWith("/login")) {
     let body;
@@ -533,6 +826,8 @@ export const handler = async (event) => {
   const sessionCancel = path.match(/\/sessions\/(\d+)\/cancel$/);
 
   try {
+    if (method === "GET" && path.endsWith("/export")) return exportCsv();
+
     if (method === "GET" && path.endsWith("/submissions")) {
       const rows = await query(`SELECT id, created_at, name, email, phone, location, experience,
                      preferred_contact, goals, message, client_id

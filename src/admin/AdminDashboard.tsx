@@ -180,6 +180,19 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
     return body;
   }, [token, onLogout]);
 
+  const exportCsv = async () => {
+    const res = await fetch('/api/admin/export', { headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 401) { onLogout(); return; }
+    if (!res.ok) { setError('Could not export'); return; }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'rising-with-rachel.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
@@ -315,6 +328,7 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
           <button type="button" className={`rwr-admin-ghost${view === 'clients' ? ' is-on' : ''}`} onClick={() => { setView('clients'); setSelected(null); }}>Clients</button>
           <input className="rwr-admin-search" placeholder={view === 'clients' ? 'Search clients…' : 'Search inquiries…'} value={query} onChange={(e) => setQuery(e.target.value)} />
           <button className="rwr-admin-ghost" onClick={load} title="Refresh">↻</button>
+          <button className="rwr-admin-ghost" onClick={exportCsv}>Export</button>
           <button className="rwr-admin-ghost" onClick={onLogout}>Sign out</button>
         </div>
       </header>

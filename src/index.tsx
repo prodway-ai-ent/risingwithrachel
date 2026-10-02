@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import './index.css';
 import App from './App';
 import AdminDashboard from './admin/AdminDashboard';
+import SessionPage from './session/SessionPage';
 import './theme.css';
 import reportWebVitals from './reportWebVitals';
 
@@ -16,6 +17,7 @@ root.render(
       <Routes>
         <Route path="/" element={<App />} />
         <Route path="/admin" element={<AdminDashboard />} />
+        <Route path="/session/:token" element={<SessionPage />} />
       </Routes>
     </BrowserRouter>
   </React.StrictMode>
