@@ -26,10 +26,11 @@ const Footer: React.FC = () => {
           <div className="rwr-footer-cols">
             <div className="rwr-footer-col">
               <h5>Explore</h5>
-              <a href="#about">About</a>
-              <a href="#services">Services</a>
-              <a href="#experience">Experience</a>
-              <a href="#contact">Contact</a>
+              <a href="/#about">About</a>
+              <a href="/#services">Services</a>
+              <a href="/#experience">Experience</a>
+              <a href="/book">Book</a>
+              <a href="/#contact">Contact</a>
             </div>
             <div className="rwr-footer-col">
               <h5>Get in touch</h5>

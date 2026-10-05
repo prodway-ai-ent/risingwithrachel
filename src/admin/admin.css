@@ -116,6 +116,30 @@ button.rwr-admin-reply { border: 0; cursor: pointer; }
   margin-top: 12px;
 }
 .rwr-admin-session .rwr-admin-muted { display: block; margin-top: 2px; }
+.rwr-admin-calendar { max-width: 980px; margin: 0 auto; padding: 8px 28px 48px; }
+.rwr-admin-day {
+  margin-top: 14px; padding: 18px 18px 10px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+}
+.rwr-admin-day h3 { font-family: 'Fraunces', serif; color: #fff; font-size: 1.25rem; margin: 0 0 4px; }
+.rwr-admin-slots { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.rwr-admin-slot {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 14px; border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03); border: 1px solid var(--line);
+}
+.rwr-admin-slot strong { font-family: 'Fraunces', serif; font-weight: 600; color: #fff; }
+.rwr-admin-slot .rwr-admin-muted { display: block; margin-top: 2px; font-size: 0.78rem; }
+.rwr-admin-slot-actions { display: flex; gap: 8px; flex: none; }
+.rwr-admin-slot .rwr-admin-reply { margin-top: 0; padding: 8px 14px; }
+.rwr-admin-slot.is-requested { border-color: rgba(255, 206, 92, 0.45); background: rgba(255, 166, 43, 0.08); }
+.rwr-admin-slot.is-requested strong { color: var(--gold); }
+.rwr-admin-slot.is-scheduled,
+.rwr-admin-slot.is-accepted { border-color: rgba(255, 106, 69, 0.35); }
+.rwr-admin-slot.is-scheduled strong,
+.rwr-admin-slot.is-accepted strong { color: var(--amber); }
+.rwr-admin-slot.is-open { opacity: 0.72; }
+@media (max-width: 720px) { .rwr-admin-slots { grid-template-columns: 1fr; } }
 
 /* ---------- Stats ---------- */
 .rwr-admin-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 28px 28px 0; max-width: 980px; margin: 0 auto; }

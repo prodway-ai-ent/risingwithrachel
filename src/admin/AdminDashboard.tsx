@@ -152,8 +152,19 @@ const formatDate = (s: string) => {
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
 };
 
+type CalendarSlot = {
+  startsAt: string;
+  label: string;
+  status: string;
+  sessionId?: number;
+  name?: string;
+  email?: string;
+};
+
+type CalendarDay = { day: string; label: string; slots: CalendarSlot[] };
+
 const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, onLogout }) => {
-  const [view, setView] = useState<'inquiries' | 'clients'>('inquiries');
+  const [view, setView] = useState<'inquiries' | 'clients' | 'calendar'>('inquiries');
   const [subs, setSubs] = useState<Submission[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [loading, setLoading] = useState(true);
@@ -164,9 +175,10 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
   const [clientInquiries, setClientInquiries] = useState<Submission[]>([]);
   const [notes, setNotes] = useState('');
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [hoursLabel, setHoursLabel] = useState('Monday through Friday, 9 AM to 5 PM Central');
+  const [hoursLabel, setHoursLabel] = useState('Monday through Friday, 9 AM to 5 PM Eastern');
   const [startsAt, setStartsAt] = useState('');
   const [duration, setDuration] = useState('60');
+  const [days, setDays] = useState<CalendarDay[]>([]);
   const [saving, setSaving] = useState(false);
 
   const api = useCallback(async (path: string, options: RequestInit = {}) => {
@@ -191,6 +203,33 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
     link.download = 'rising-with-rachel.csv';
     link.click();
     URL.revokeObjectURL(url);
+  };
+
+  const loadCalendar = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const body = await api('/api/admin/calendar');
+      setDays(body.days || []);
+      if (body.availabilityLabel) setHoursLabel(body.availabilityLabel);
+    } catch (err: any) {
+      if (err.message !== 'Unauthorized') setError(err.message || 'Failed to load the calendar');
+    } finally {
+      setLoading(false);
+    }
+  }, [api]);
+
+  const decide = async (id: number, action: 'accept' | 'deny' | 'cancel') => {
+    setSaving(true);
+    setError('');
+    try {
+      await api(`/api/admin/sessions/${id}/${action}`, { method: 'POST' });
+      await loadCalendar();
+    } catch (err: any) {
+      setError(err.message || 'Could not update the session');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const load = useCallback(async () => {
@@ -320,20 +359,21 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
           <span className="rwr-admin-logo sm">RR</span>
           <div>
             <strong>Rising with Rachel</strong>
-            <span>{view === 'clients' ? 'Clients' : 'Client inquiries'}</span>
+            <span>{view === 'calendar' ? 'Calendar' : view === 'clients' ? 'Clients' : 'Client inquiries'}</span>
           </div>
         </div>
         <div className="rwr-admin-actions">
           <button type="button" className={`rwr-admin-ghost${view === 'inquiries' ? ' is-on' : ''}`} onClick={() => { setView('inquiries'); setClient(null); }}>Inquiries</button>
           <button type="button" className={`rwr-admin-ghost${view === 'clients' ? ' is-on' : ''}`} onClick={() => { setView('clients'); setSelected(null); }}>Clients</button>
+          <button type="button" className={`rwr-admin-ghost${view === 'calendar' ? ' is-on' : ''}`} onClick={() => { setView('calendar'); setSelected(null); setClient(null); loadCalendar(); }}>Calendar</button>
           <input className="rwr-admin-search" placeholder={view === 'clients' ? 'Search clients…' : 'Search inquiries…'} value={query} onChange={(e) => setQuery(e.target.value)} />
-          <button className="rwr-admin-ghost" onClick={load} title="Refresh">↻</button>
+          <button className="rwr-admin-ghost" onClick={() => view === 'calendar' ? loadCalendar() : load()} title="Refresh">↻</button>
           <button className="rwr-admin-ghost" onClick={exportCsv}>Export</button>
           <button className="rwr-admin-ghost" onClick={onLogout}>Sign out</button>
         </div>
       </header>
 
-      <div className="rwr-admin-stats">
+      {view !== 'calendar' && <div className="rwr-admin-stats">
         <motion.div className="rwr-admin-stat" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
           <Counter className="rwr-admin-stat-num" to={view === 'clients' ? clients.length : subs.length} />
           <span className="rwr-admin-stat-label">{view === 'clients' ? 'Clients' : 'Total inquiries'}</span>
@@ -345,17 +385,51 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
           />
           <span className="rwr-admin-stat-label">Last 7 days</span>
         </motion.div>
-      </div>
+      </div>}
 
       <main className="rwr-admin-main">
-        {error && !loading && <div className="rwr-admin-empty">{error}</div>}
-        {loading ? (
+        {view === 'calendar' && (
+          <div className="rwr-admin-calendar">
+            <p className="rwr-admin-muted">{hoursLabel}. One hour at a time.</p>
+            {error && !loading && <div className="rwr-admin-empty">{error}</div>}
+            {loading ? <div className="rwr-admin-empty">Loading the calendar…</div> : days.map((day) => (
+              <section key={day.day} className="rwr-admin-day">
+                <h3>{day.label}</h3>
+                <div className="rwr-admin-slots">
+                  {day.slots.map((slot) => (
+                    <div key={slot.startsAt} className={`rwr-admin-slot is-${slot.status}`}>
+                      <div>
+                        <strong>{slot.label}</strong>
+                        {slot.name && <span className="rwr-admin-muted">{slot.name}{slot.email ? ` · ${slot.email}` : ''}</span>}
+                        {slot.status === 'open' && <span className="rwr-admin-muted">Open</span>}
+                        {slot.status === 'accepted' && <span className="rwr-admin-muted">Accepted</span>}
+                        {slot.status === 'scheduled' && <span className="rwr-admin-muted">Scheduled</span>}
+                        {slot.status === 'requested' && <span className="rwr-admin-muted">Requested</span>}
+                      </div>
+                      {slot.status === 'requested' && slot.sessionId && (
+                        <div className="rwr-admin-slot-actions">
+                          <button type="button" className="rwr-admin-reply" disabled={saving} onClick={() => decide(slot.sessionId as number, 'accept')}>Accept</button>
+                          <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => decide(slot.sessionId as number, 'deny')}>Deny</button>
+                        </div>
+                      )}
+                      {(slot.status === 'scheduled' || slot.status === 'accepted') && slot.sessionId && (
+                        <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => decide(slot.sessionId as number, 'cancel')}>Cancel</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ))}
+          </div>
+        )}
+        {view !== 'calendar' && error && !loading && <div className="rwr-admin-empty">{error}</div>}
+        {view !== 'calendar' && loading ? (
           <div className="rwr-admin-skeletons">
             {Array.from({ length: 5 }).map((_, i) => <div key={i} className="rwr-admin-skeleton" />)}
           </div>
-        ) : filtered.length === 0 ? (
+        ) : view !== 'calendar' && filtered.length === 0 ? (
           <div className="rwr-admin-empty">{view === 'clients' ? 'No clients yet.' : 'No inquiries yet.'}</div>
-        ) : (
+        ) : view !== 'calendar' ? (
           <motion.ul className="rwr-admin-list" initial="hidden" animate="show"
             variants={{ hidden: {}, show: { transition: { staggerChildren: 0.04 } } }}>
             <AnimatePresence>
@@ -385,7 +459,7 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
               ))}
             </AnimatePresence>
           </motion.ul>
-        )}
+        ) : null}
       </main>
 
       <AnimatePresence>
@@ -461,7 +535,7 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
                     </div>
                   ))}
                   <label className="rwr-admin-field">
-                    <span>Start, Central time</span>
+                    <span>Start, Eastern time</span>
                     <input type="datetime-local" value={startsAt} onChange={(e) => setStartsAt(e.target.value)} />
                   </label>
                   <label className="rwr-admin-field">
