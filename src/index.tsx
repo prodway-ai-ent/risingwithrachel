@@ -5,6 +5,7 @@ import './index.css';
 import App from './App';
 import AdminDashboard from './admin/AdminDashboard';
 import SessionPage from './session/SessionPage';
+import BookPage from './book/BookPage';
 import './theme.css';
 import reportWebVitals from './reportWebVitals';
 
@@ -18,6 +19,7 @@ root.render(
         <Route path="/" element={<App />} />
         <Route path="/admin" element={<AdminDashboard />} />
         <Route path="/session/:token" element={<SessionPage />} />
+        <Route path="/book" element={<BookPage />} />
       </Routes>
     </BrowserRouter>
   </React.StrictMode>

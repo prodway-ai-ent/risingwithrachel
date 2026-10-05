@@ -268,15 +268,21 @@ function clock(minutes) {
   return minute ? `${hour}:${String(minute).padStart(2, "0")} ${suffix}` : `${hour} ${suffix}`;
 }
 
+function zoneWord(timeZone) {
+  if (timeZone === "America/New_York") return "Eastern";
+  if (timeZone === "America/Chicago") return "Central";
+  return timeZone;
+}
+
 function availabilityLabel(rule) {
   const days = String(rule.weekdays).split(",").map((day) => WEEKDAY_NAMES[Number(day)]).filter(Boolean);
   const span = days.length > 1 ? `${days[0]} through ${days[days.length - 1]}` : days[0] || "those days";
-  return `${span}, ${clock(rule.work_start_minute)} to ${clock(rule.work_end_minute)} Central`;
+  return `${span}, ${clock(rule.work_start_minute)} to ${clock(rule.work_end_minute)} ${zoneWord(rule.timezone)}`;
 }
 
 async function loadAvailability() {
   const rows = await query(
-    "SELECT timezone, work_start_minute, work_end_minute, weekdays FROM availability WHERE id = 1",
+    "SELECT timezone, work_start_minute, work_end_minute, weekdays, slot_minutes FROM availability WHERE id = 1",
   );
   if (!rows.length) throw new Error("Working hours are not configured.");
   return {
@@ -284,6 +290,7 @@ async function loadAvailability() {
     work_start_minute: Number(rows[0].work_start_minute),
     work_end_minute: Number(rows[0].work_end_minute),
     weekdays: rows[0].weekdays,
+    slot_minutes: Number(rows[0].slot_minutes || 60),
   };
 }
 
@@ -487,7 +494,7 @@ async function planSession(startsAt, durationMinutes, excludeId) {
   }
   const overlap = await query(
     `SELECT id FROM sessions
-     WHERE status = 'scheduled' AND starts_at < CAST(:ends AS timestamptz) AND ends_at > CAST(:starts AS timestamptz)${exclude}
+     WHERE status IN ('scheduled', 'requested', 'accepted') AND starts_at < CAST(:ends AS timestamptz) AND ends_at > CAST(:starts AS timestamptz)${exclude}
      LIMIT 1`,
     parameters,
   );
@@ -772,6 +779,166 @@ async function exportCsv() {
   };
 }
 
+function addDays(day, count) {
+  const [year, month, date] = day.split("-").map(Number);
+  const next = new Date(Date.UTC(year, month - 1, date + count));
+  return `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, "0")}-${String(next.getUTCDate()).padStart(2, "0")}`;
+}
+
+function parseDbTime(value) {
+  const text = String(value || "");
+  return new Date(text.includes("T") || text.endsWith("Z") ? text : `${text.replace(" ", "T")}Z`);
+}
+
+async function calendarDays(includePrivate) {
+  const rule = await loadAvailability();
+  const slotMinutes = rule.slot_minutes || 60;
+  const horizon = new Date(Date.now() + 28 * 86400000).toISOString();
+  const busy = await query(
+    `SELECT s.id, s.starts_at, s.ends_at, s.status, c.name, c.email
+     FROM sessions s JOIN clients c ON c.id = s.client_id
+     WHERE s.status IN ('requested', 'accepted', 'scheduled')
+       AND s.ends_at > now()
+       AND s.starts_at < CAST(:horizon AS timestamptz)`,
+    [textParam("horizon", horizon)],
+  );
+  const taken = busy.map((row) => ({ ...row, start: parseDbTime(row.starts_at), end: parseDbTime(row.ends_at) }));
+  const allowed = new Set(String(rule.weekdays).split(",").map(Number));
+  const today = zoneParts(new Date(), rule.timezone).day;
+  const days = [];
+  for (let offset = 0; offset < 28; offset += 1) {
+    const day = addDays(today, offset);
+    const noon = utcFromLocal(`${day}T12:00`, rule.timezone);
+    if (!noon || !allowed.has(zoneParts(noon, rule.timezone).weekday)) continue;
+    const slots = [];
+    for (let minute = rule.work_start_minute; minute + slotMinutes <= rule.work_end_minute; minute += slotMinutes) {
+      const local = `${day}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+      const start = utcFromLocal(local, rule.timezone);
+      if (!start || start.getTime() <= Date.now()) continue;
+      const end = new Date(start.getTime() + slotMinutes * 60 * 1000);
+      const hit = taken.find((row) => row.start < end && row.end > start);
+      const slot = { startsAt: local, label: clock(minute), status: hit ? (includePrivate ? hit.status : "taken") : "open" };
+      if (hit && includePrivate) {
+        slot.sessionId = hit.id;
+        slot.name = hit.name;
+        slot.email = hit.email;
+      }
+      slots.push(slot);
+    }
+    if (slots.length) {
+      days.push({
+        day,
+        label: new Intl.DateTimeFormat("en-US", { timeZone: rule.timezone, weekday: "long", month: "short", day: "numeric" }).format(noon),
+        slots,
+      });
+    }
+  }
+  return { days, availabilityLabel: availabilityLabel(rule) };
+}
+
+async function requestSlot(body) {
+  const name = String(body.name || "").trim();
+  const email = String(body.email || "").trim();
+  const phone = String(body.phone || "").trim();
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return json(400, { ok: false, error: "Name and a valid email are required." });
+  }
+  const rule = await loadAvailability();
+  const slot = rule.slot_minutes || 60;
+  const plan = await planSession(body.startsAt, slot);
+  if (plan.error) return plan.error;
+  const parts = zoneParts(plan.start, rule.timezone);
+  if ((parts.minutes - rule.work_start_minute) % slot !== 0) {
+    return json(400, { ok: false, error: "Choose one of the open hours." });
+  }
+  let clients = await query(
+    "SELECT id, name, email FROM clients WHERE lower(email) = lower(:email) ORDER BY id DESC LIMIT 1",
+    [textParam("email", email)],
+  );
+  if (!clients.length) {
+    clients = await query(
+      `INSERT INTO clients (name, email, phone, created_by)
+       VALUES (:name, :email, :phone, 'booking')
+       RETURNING id, name, email`,
+      [textParam("name", name), textParam("email", email), textParam("phone", phone)],
+    );
+  }
+  const manageToken = crypto.randomBytes(24).toString("base64url");
+  await query(
+    `INSERT INTO sessions (client_id, starts_at, ends_at, status, created_by, calendar_sync_status, manage_token)
+     VALUES (:clientId, CAST(:starts AS timestamptz), CAST(:ends AS timestamptz), 'requested', 'booking', 'pending', :token)`,
+    [
+      longParam("clientId", clients[0].id),
+      textParam("starts", plan.start.toISOString()),
+      textParam("ends", plan.end.toISOString()),
+      textParam("token", manageToken),
+    ],
+  );
+  const when = whenLabel(plan.start, rule);
+  await sendMail(
+    NOTIFY_ADDRESS,
+    `Session request from ${name}`,
+    `<div style="font-family:Arial,sans-serif;color:#111"><p><strong>${esc(name)}</strong> (${esc(email)}) asked for ${esc(when)}.</p><p>Accept or deny it in the admin calendar.</p></div>`,
+  );
+  return json(200, { ok: true, notice: "Request sent. Rachel will accept or deny this hour." });
+}
+
+async function sessionWithClient(id) {
+  const rows = await query(
+    `SELECT s.id, s.starts_at, s.ends_at, s.status, s.manage_token, s.google_event_id, c.name, c.email
+     FROM sessions s JOIN clients c ON c.id = s.client_id
+     WHERE s.id = :id`,
+    [longParam("id", id)],
+  );
+  return rows[0] || null;
+}
+
+async function acceptSession(id) {
+  const row = await sessionWithClient(id);
+  if (!row) return json(404, { ok: false, error: "Session not found." });
+  if (row.status !== "requested") return json(400, { ok: false, error: "This request was already handled." });
+  const updated = await query(
+    `UPDATE sessions SET status = 'accepted', updated_at = now()
+     WHERE id = :id AND status = 'requested'
+     RETURNING id`,
+    [longParam("id", id)],
+  );
+  if (!updated.length) return json(400, { ok: false, error: "This request was already handled." });
+  const mail = await sendMail(
+    row.email,
+    "Rachel will be in touch",
+    `<div style="font-family:Arial,sans-serif;max-width:560px;color:#111">
+      <p>Hi ${esc(String(row.name).split(" ")[0])},</p>
+      <p>Rachel will be in touch to schedule a time for a phone call.</p>
+      <p style="margin-top:24px">Rachel<br/><span style="color:#888">Rising with Rachel</span></p>
+    </div>`,
+  );
+  return json(200, { ok: true, ...mail });
+}
+
+async function denySession(id) {
+  const row = await sessionWithClient(id);
+  if (!row) return json(404, { ok: false, error: "Session not found." });
+  if (row.status !== "requested") return json(400, { ok: false, error: "This request was already handled." });
+  const updated = await query(
+    `UPDATE sessions SET status = 'denied', updated_at = now()
+     WHERE id = :id AND status = 'requested'
+     RETURNING id`,
+    [longParam("id", id)],
+  );
+  if (!updated.length) return json(400, { ok: false, error: "This request was already handled." });
+  const mail = await sendMail(
+    row.email,
+    "Rachel can't take that request",
+    `<div style="font-family:Arial,sans-serif;max-width:560px;color:#111">
+      <p>Hi ${esc(String(row.name).split(" ")[0])},</p>
+      <p>Rachel isn't able to take your request.</p>
+      <p style="margin-top:24px">Rachel<br/><span style="color:#888">Rising with Rachel</span></p>
+    </div>`,
+  );
+  return json(200, { ok: true, ...mail });
+}
+
 export const handler = async (event) => {
   const method = event?.requestContext?.http?.method;
   const path = event?.requestContext?.http?.path || event?.rawPath || "";
@@ -813,6 +980,26 @@ export const handler = async (event) => {
     }
   }
 
+  if (method === "GET" && path.endsWith("/availability")) {
+    try {
+      return json(200, { ok: true, ...(await calendarDays(false)) });
+    } catch (err) {
+      console.error("Availability failed:", err);
+      return json(500, { ok: false, error: "Request failed" });
+    }
+  }
+
+  if (method === "POST" && path.endsWith("/requests")) {
+    let body;
+    try { body = JSON.parse(event.body || "{}"); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
+    try {
+      return await requestSlot(body);
+    } catch (err) {
+      console.error("Booking request failed:", err);
+      return json(500, { ok: false, error: "Request failed" });
+    }
+  }
+
   if (method === "POST" && path.endsWith("/login")) {
     let body;
     try { body = JSON.parse(event.body || "{}"); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
@@ -824,9 +1011,15 @@ export const handler = async (event) => {
 
   const clientMatch = path.match(/\/clients\/(\d+)$/);
   const sessionCancel = path.match(/\/sessions\/(\d+)\/cancel$/);
+  const sessionAccept = path.match(/\/sessions\/(\d+)\/accept$/);
+  const sessionDeny = path.match(/\/sessions\/(\d+)\/deny$/);
 
   try {
     if (method === "GET" && path.endsWith("/export")) return exportCsv();
+
+    if (method === "GET" && path.endsWith("/calendar")) {
+      return json(200, { ok: true, ...(await calendarDays(true)) });
+    }
 
     if (method === "GET" && path.endsWith("/submissions")) {
       const rows = await query(`SELECT id, created_at, name, email, phone, location, experience,
@@ -850,7 +1043,7 @@ export const handler = async (event) => {
       );
       const sessions = await query(
         `SELECT ${SESSION_COLUMNS}
-         FROM sessions WHERE client_id = :id AND status <> 'cancelled'
+         FROM sessions WHERE client_id = :id AND status NOT IN ('cancelled', 'denied')
          ORDER BY starts_at`,
         [longParam("id", id)],
       );
@@ -931,6 +1124,10 @@ export const handler = async (event) => {
     if (method === "POST" && sessionCancel) {
       return cancelSession(sessionCancel[1]);
     }
+
+    if (method === "POST" && sessionAccept) return acceptSession(sessionAccept[1]);
+
+    if (method === "POST" && sessionDeny) return denySession(sessionDeny[1]);
   } catch (err) {
     console.error("Admin request failed:", err);
     return json(500, { ok: false, error: "Request failed" });

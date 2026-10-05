@@ -89,7 +89,7 @@ const SessionPage: React.FC = () => {
                   {saving ? 'Saving…' : 'Cancel session'}
                 </button>
                 <label className="rwr-admin-field">
-                  <span>New start, Central time</span>
+                  <span>New start, Eastern time</span>
                   <input type="datetime-local" value={startsAt} onChange={(e) => setStartsAt(e.target.value)} />
                 </label>
                 <label className="rwr-admin-field">

@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
 
 const LINKS = [
-  { href: '#about', label: 'About' },
-  { href: '#services', label: 'Services' },
-  { href: '#experience', label: 'Experience' },
-  { href: '#contact', label: 'Contact' },
+  { href: '/#about', label: 'About' },
+  { href: '/#services', label: 'Services' },
+  { href: '/#experience', label: 'Experience' },
+  { href: '/book', label: 'Book' },
+  { href: '/#contact', label: 'Contact' },
 ];
 
 const Header: React.FC = () => {
@@ -23,7 +24,7 @@ const Header: React.FC = () => {
   return (
     <header className={navClass}>
       <div className="rwr-container rwr-nav-inner">
-        <a className="rwr-brand" href="#home" onClick={() => setOpen(false)}>
+        <a className="rwr-brand" href="/" onClick={() => setOpen(false)}>
           <span className="rwr-mark">RR</span>
           Rising&nbsp;with&nbsp;Rachel
         </a>
