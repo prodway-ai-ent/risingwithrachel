@@ -132,14 +132,42 @@ button.rwr-admin-reply { border: 0; cursor: pointer; }
 .rwr-admin-slot .rwr-admin-muted { display: block; margin-top: 2px; font-size: 0.78rem; }
 .rwr-admin-slot-actions { display: flex; gap: 8px; flex: none; }
 .rwr-admin-slot .rwr-admin-reply { margin-top: 0; padding: 8px 14px; }
-.rwr-admin-slot.is-requested { border-color: rgba(255, 206, 92, 0.45); background: rgba(255, 166, 43, 0.08); }
-.rwr-admin-slot.is-requested strong { color: var(--gold); }
+.rwr-admin-slot.is-pending { border-color: rgba(255, 206, 92, 0.45); background: rgba(255, 166, 43, 0.08); }
+.rwr-admin-slot.is-pending strong { color: var(--gold); }
 .rwr-admin-slot.is-scheduled,
-.rwr-admin-slot.is-accepted { border-color: rgba(255, 106, 69, 0.35); }
+.rwr-admin-slot.is-approved { border-color: rgba(255, 106, 69, 0.35); }
 .rwr-admin-slot.is-scheduled strong,
-.rwr-admin-slot.is-accepted strong { color: var(--amber); }
-.rwr-admin-slot.is-open { opacity: 0.72; }
-@media (max-width: 720px) { .rwr-admin-slots { grid-template-columns: 1fr; } }
+.rwr-admin-slot.is-approved strong { color: var(--amber); }
+.rwr-admin-slot.is-available { opacity: 0.72; }
+.rwr-admin-slot.is-blocked { opacity: 0.55; border-style: dashed; }
+.rwr-admin-slot.is-blocked strong { color: var(--muted); text-decoration: line-through; }
+.rwr-admin-slot .rwr-admin-ghost { padding: 8px 12px; font-size: 0.82rem; flex: none; }
+.rwr-admin-day-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.rwr-admin-hours-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.rwr-admin-hours-head p { margin: 0; }
+.rwr-admin-hours-head .rwr-admin-ghost,
+.rwr-admin-day-head .rwr-admin-ghost { white-space: nowrap; flex: none; }
+.rwr-admin-hours p { margin: 0; }
+.rwr-admin-hours-grid { display: grid; gap: 8px; margin-top: 14px; }
+.rwr-admin-hours-row {
+  display: grid; grid-template-columns: 150px 1fr auto 1fr; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: 12px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--line);
+}
+.rwr-admin-hours-row.is-off { opacity: 0.55; }
+.rwr-admin-hours-day { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 600; cursor: pointer; }
+.rwr-admin-hours-day input { accent-color: var(--ember); width: 16px; height: 16px; }
+.rwr-admin-hours-row select {
+  border: 1px solid var(--line-2); border-radius: 10px; padding: 8px 10px;
+  background: var(--panel-2); color: var(--text); font: inherit;
+}
+.rwr-admin-hours-row select:disabled { opacity: 0.5; }
+@media (max-width: 720px) {
+  .rwr-admin-slots { grid-template-columns: 1fr; }
+  .rwr-admin-hours-head { flex-direction: column; }
+  .rwr-admin-hours-row { grid-template-columns: 1fr 1fr; }
+  .rwr-admin-hours-day { grid-column: 1 / -1; }
+  .rwr-admin-hours-row .rwr-admin-muted { display: none; }
+}
 
 /* ---------- Stats ---------- */
 .rwr-admin-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 28px 28px 0; max-width: 980px; margin: 0 auto; }

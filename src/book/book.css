@@ -20,31 +20,28 @@
 
 .rwr-book-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.7fr);
+  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
   gap: 28px;
   align-items: start;
 }
 
 .rwr-book-calendar { display: grid; gap: 16px; }
 
-.rwr-cal,
-.rwr-book-hours {
+.rwr-cal {
   background: var(--paper);
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   padding: 22px 22px 18px;
   box-shadow: var(--shadow-sm);
 }
-.rwr-cal-head,
-.rwr-book-hours header {
+.rwr-cal-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  margin-bottom: 16px;
 }
-.rwr-cal-head { margin-bottom: 16px; }
-.rwr-cal-head h2,
-.rwr-book-hours h2 { font-size: 1.55rem; margin: 0; }
+.rwr-cal-head h2 { font-size: 1.55rem; margin: 0; }
 .rwr-cal-nav { display: flex; gap: 8px; }
 .rwr-cal-nav button {
   width: 40px;
@@ -100,17 +97,34 @@
   background: var(--ember);
 }
 .rwr-cal-grid button.is-picked .dot { background: var(--gold); }
-.rwr-book-hours { scroll-margin-top: 96px; }
-.rwr-book-hours header { margin-bottom: 4px; }
-.rwr-book-hours header span,
-.rwr-book-hours > p {
+.rwr-cal-legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 0;
   color: var(--muted);
-  font-size: 0.82rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 0.8rem;
 }
-.rwr-book-hours > p { margin: 0 0 14px; }
+.rwr-cal-legend .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ember); display: inline-block; }
+.rwr-cal-none { margin: 14px 0 0; color: var(--muted); }
+
+.rwr-book-panel .rwr-book-slots { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.rwr-book-hours .sub { margin-bottom: 14px; }
+.rwr-book-fine { margin: 14px 0 0; color: var(--muted); font-size: 0.82rem; }
+.rwr-book-link {
+  justify-self: center;
+  border: 0;
+  background: none;
+  padding: 4px 0;
+  font: inherit;
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: var(--ember-deep);
+  cursor: pointer;
+}
+.rwr-book-link:hover { color: var(--ink); }
+.rwr-book-success p strong { color: var(--ink); }
+.rwr-book-success .rwr-btn { width: 100%; }
 
 .rwr-book-slots {
   display: grid;
@@ -243,7 +257,7 @@
 
 .rwr-book-skeleton { display: grid; gap: 16px; }
 .rwr-book-skeleton div {
-  height: 168px;
+  height: 420px;
   border-radius: var(--r-lg);
   background: linear-gradient(90deg, var(--cream-2) 25%, #fff 37%, var(--cream-2) 63%);
   background-size: 400% 100%;
@@ -261,8 +275,7 @@
   .rwr-book-main { padding-top: 112px; }
 }
 @media (max-width: 520px) {
-  .rwr-cal,
-  .rwr-book-hours { padding: 16px 14px 12px; }
+  .rwr-cal { padding: 16px 14px 12px; }
   .rwr-cal-grid button,
   .rwr-cal-grid .is-off,
   .rwr-cal-grid .is-pad { font-size: 0.95rem; border-radius: 12px; }
