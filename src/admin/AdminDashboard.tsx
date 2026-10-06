@@ -157,11 +157,28 @@ type CalendarSlot = {
   label: string;
   status: string;
   sessionId?: number;
+  blockId?: number;
+  reason?: string | null;
   name?: string;
   email?: string;
 };
 
 type CalendarDay = { day: string; label: string; slots: CalendarSlot[] };
+type HoursRule = { weekday: number; name: string; active: boolean; start_minute: number; end_minute: number };
+
+const SLOT_LABELS: Record<string, string> = {
+  available: 'Available',
+  blocked: 'Blocked',
+  pending: 'Pending request',
+  approved: 'Approved',
+  scheduled: 'Scheduled',
+};
+
+const HOUR_OPTIONS = Array.from({ length: 25 }, (_, hour) => {
+  const minute = hour * 60;
+  const label = hour === 0 || hour === 24 ? '12 AM' : hour === 12 ? '12 PM' : hour < 12 ? `${hour} AM` : `${hour - 12} PM`;
+  return { minute, label };
+});
 
 const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, onLogout }) => {
   const [view, setView] = useState<'inquiries' | 'clients' | 'calendar'>('inquiries');
@@ -179,6 +196,10 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
   const [startsAt, setStartsAt] = useState('');
   const [duration, setDuration] = useState('60');
   const [days, setDays] = useState<CalendarDay[]>([]);
+  const [zoneLabel, setZoneLabel] = useState('Eastern Time');
+  const [slotMinutes, setSlotMinutes] = useState(60);
+  const [rules, setRules] = useState<HoursRule[]>([]);
+  const [editingHours, setEditingHours] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const api = useCallback(async (path: string, options: RequestInit = {}) => {
@@ -209,9 +230,12 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
     setLoading(true);
     setError('');
     try {
-      const body = await api('/api/admin/calendar');
+      const [body, settings] = await Promise.all([api('/api/admin/calendar'), api('/api/admin/availability')]);
       setDays(body.days || []);
       if (body.availabilityLabel) setHoursLabel(body.availabilityLabel);
+      if (body.timezoneLabel) setZoneLabel(body.timezoneLabel);
+      if (body.slotMinutes) setSlotMinutes(Number(body.slotMinutes));
+      setRules(settings.rules || []);
     } catch (err: any) {
       if (err.message !== 'Unauthorized') setError(err.message || 'Failed to load the calendar');
     } finally {
@@ -219,18 +243,52 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
     }
   }, [api]);
 
-  const decide = async (id: number, action: 'accept' | 'deny' | 'cancel') => {
+  const runCalendarAction = async (work: () => Promise<unknown>, fallback: string) => {
     setSaving(true);
     setError('');
     try {
-      await api(`/api/admin/sessions/${id}/${action}`, { method: 'POST' });
+      await work();
       await loadCalendar();
     } catch (err: any) {
-      setError(err.message || 'Could not update the session');
+      setError(err.message || fallback);
     } finally {
       setSaving(false);
     }
   };
+
+  const decide = (id: number, action: 'accept' | 'deny' | 'cancel') =>
+    runCalendarAction(() => api(`/api/admin/sessions/${id}/${action}`, { method: 'POST' }), 'Could not update the request');
+
+  const blockSlot = (slot: CalendarSlot) => runCalendarAction(() => api('/api/admin/blocks', {
+    method: 'POST',
+    body: JSON.stringify({
+      startsAt: slot.startsAt,
+      endsAt: new Date(new Date(slot.startsAt).getTime() + slotMinutes * 60000).toISOString(),
+    }),
+  }), 'Could not block that hour');
+
+  const blockDay = (day: CalendarDay) => {
+    const open = day.slots.filter((slot) => slot.status === 'available');
+    if (!open.length) return;
+    const first = open[0].startsAt;
+    const last = new Date(new Date(open[open.length - 1].startsAt).getTime() + slotMinutes * 60000).toISOString();
+    return runCalendarAction(() => api('/api/admin/blocks', {
+      method: 'POST',
+      body: JSON.stringify({ startsAt: first, endsAt: last, reason: 'Day off' }),
+    }), 'Could not block that day');
+  };
+
+  const unblock = (blockId: number) =>
+    runCalendarAction(() => api(`/api/admin/blocks/${blockId}`, { method: 'DELETE' }), 'Could not reopen that hour');
+
+  const updateRule = (weekday: number, patch: Partial<HoursRule>) =>
+    setRules((rows) => rows.map((row) => row.weekday === weekday ? { ...row, ...patch } : row));
+
+  const saveHours = () => runCalendarAction(async () => {
+    const body = await api('/api/admin/availability', { method: 'PUT', body: JSON.stringify({ rules }) });
+    setRules(body.rules || []);
+    setEditingHours(false);
+  }, 'Could not save the weekly hours');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -287,10 +345,10 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
     }
   };
 
-  const calendarNote = (status?: string) => {
-    if (status === 'synced') return 'On Google Calendar';
-    if (status === 'error') return 'Calendar sync needs attention';
-    return 'Waiting for Google Calendar credentials';
+  const calendarNote = (session: Session) => {
+    if (session.calendar_sync_status === 'synced') return 'On the external calendar';
+    if (session.calendar_sync_status === 'error') return 'Calendar sync needs attention';
+    return SLOT_LABELS[session.status] || session.status;
   };
 
   const bookSession = async () => {
@@ -390,30 +448,72 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
       <main className="rwr-admin-main">
         {view === 'calendar' && (
           <div className="rwr-admin-calendar">
-            <p className="rwr-admin-muted">{hoursLabel}. One hour at a time.</p>
+            <div className="rwr-admin-hours-head">
+              <p className="rwr-admin-muted">{hoursLabel}. Times in {zoneLabel}. Visitors can request any available hour; nothing is confirmed until you approve it.</p>
+              <button type="button" className={`rwr-admin-ghost${editingHours ? ' is-on' : ''}`} onClick={() => setEditingHours((on) => !on)}>
+                {editingHours ? 'Close' : 'Weekly hours'}
+              </button>
+            </div>
+            {editingHours && (
+              <section className="rwr-admin-day rwr-admin-hours">
+                <h3>Weekly hours</h3>
+                <p className="rwr-admin-muted">Uncheck a day to take it off the calendar. Changes apply to future requests only.</p>
+                <div className="rwr-admin-hours-grid">
+                  {rules.map((rule) => (
+                    <div key={rule.weekday} className={`rwr-admin-hours-row${rule.active ? '' : ' is-off'}`}>
+                      <label className="rwr-admin-hours-day">
+                        <input type="checkbox" checked={rule.active} onChange={(e) => updateRule(rule.weekday, { active: e.target.checked })} />
+                        <span>{rule.name}</span>
+                      </label>
+                      <select value={rule.start_minute} disabled={!rule.active} onChange={(e) => updateRule(rule.weekday, { start_minute: Number(e.target.value) })}>
+                        {HOUR_OPTIONS.slice(0, 24).map((option) => <option key={option.minute} value={option.minute}>{option.label}</option>)}
+                      </select>
+                      <span className="rwr-admin-muted">to</span>
+                      <select value={rule.end_minute} disabled={!rule.active} onChange={(e) => updateRule(rule.weekday, { end_minute: Number(e.target.value) })}>
+                        {HOUR_OPTIONS.slice(1).map((option) => <option key={option.minute} value={option.minute}>{option.label}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                <div className="rwr-admin-drawer-actions">
+                  <button type="button" className="rwr-admin-reply" disabled={saving} onClick={saveHours}>Save hours</button>
+                  <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => { setEditingHours(false); loadCalendar(); }}>Discard</button>
+                </div>
+              </section>
+            )}
             {error && !loading && <div className="rwr-admin-empty">{error}</div>}
-            {loading ? <div className="rwr-admin-empty">Loading the calendar…</div> : days.map((day) => (
+            {loading ? <div className="rwr-admin-empty">Loading the calendar…</div> : days.length === 0 ? (
+              <div className="rwr-admin-empty">No hours on the calendar. Set weekly hours to open days for requests.</div>
+            ) : days.map((day) => (
               <section key={day.day} className="rwr-admin-day">
-                <h3>{day.label}</h3>
+                <div className="rwr-admin-day-head">
+                  <h3>{day.label}</h3>
+                  {day.slots.some((slot) => slot.status === 'available') && (
+                    <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => blockDay(day)}>Block day</button>
+                  )}
+                </div>
                 <div className="rwr-admin-slots">
                   {day.slots.map((slot) => (
                     <div key={slot.startsAt} className={`rwr-admin-slot is-${slot.status}`}>
                       <div>
                         <strong>{slot.label}</strong>
                         {slot.name && <span className="rwr-admin-muted">{slot.name}{slot.email ? ` · ${slot.email}` : ''}</span>}
-                        {slot.status === 'open' && <span className="rwr-admin-muted">Open</span>}
-                        {slot.status === 'accepted' && <span className="rwr-admin-muted">Accepted</span>}
-                        {slot.status === 'scheduled' && <span className="rwr-admin-muted">Scheduled</span>}
-                        {slot.status === 'requested' && <span className="rwr-admin-muted">Requested</span>}
+                        <span className="rwr-admin-muted">{SLOT_LABELS[slot.status] || slot.status}{slot.status === 'blocked' && slot.reason ? ` · ${slot.reason}` : ''}</span>
                       </div>
-                      {slot.status === 'requested' && slot.sessionId && (
+                      {slot.status === 'pending' && slot.sessionId && (
                         <div className="rwr-admin-slot-actions">
-                          <button type="button" className="rwr-admin-reply" disabled={saving} onClick={() => decide(slot.sessionId as number, 'accept')}>Accept</button>
-                          <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => decide(slot.sessionId as number, 'deny')}>Deny</button>
+                          <button type="button" className="rwr-admin-reply" disabled={saving} onClick={() => decide(slot.sessionId as number, 'accept')}>Approve</button>
+                          <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => decide(slot.sessionId as number, 'deny')}>Decline</button>
                         </div>
                       )}
-                      {(slot.status === 'scheduled' || slot.status === 'accepted') && slot.sessionId && (
+                      {(slot.status === 'scheduled' || slot.status === 'approved') && slot.sessionId && (
                         <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => decide(slot.sessionId as number, 'cancel')}>Cancel</button>
+                      )}
+                      {slot.status === 'available' && (
+                        <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => blockSlot(slot)}>Block</button>
+                      )}
+                      {slot.status === 'blocked' && slot.blockId && (
+                        <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => unblock(slot.blockId as number)}>Unblock</button>
                       )}
                     </div>
                   ))}
@@ -529,7 +629,7 @@ const Dashboard: React.FC<{ token: string; onLogout: () => void }> = ({ token, o
                     <div key={session.id} className="rwr-admin-session">
                       <div>
                         <strong>{formatDate(session.starts_at)}</strong>
-                        <span className="rwr-admin-muted">{calendarNote(session.calendar_sync_status)}</span>
+                        <span className="rwr-admin-muted">{calendarNote(session)}</span>
                       </div>
                       <button type="button" className="rwr-admin-ghost" disabled={saving} onClick={() => cancelSession(session.id)}>Cancel</button>
                     </div>

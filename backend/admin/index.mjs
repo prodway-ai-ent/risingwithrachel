@@ -47,7 +47,7 @@ const ISSUER = `https://cognito-idp.us-east-1.amazonaws.com/${COGNITO_USER_POOL_
 const CORS = {
   "Access-Control-Allow-Origin": "https://risingwithrachel.com",
   "Access-Control-Allow-Headers": "content-type,authorization",
-  "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
+  "Access-Control-Allow-Methods": "GET,POST,PATCH,PUT,DELETE,OPTIONS",
   "Content-Type": "application/json",
 };
 const json = (statusCode, body) => ({ statusCode, headers: CORS, body: JSON.stringify(body) });
@@ -93,6 +93,8 @@ const textParam = (name, value) => ({
   value: value === undefined || value === null || value === "" ? { isNull: true } : { stringValue: String(value) },
 });
 const longParam = (name, value) => ({ name, value: { longValue: Number(value) } });
+const boolParam = (name, value) => ({ name, value: { booleanValue: Boolean(value) } });
+const isConflict = (err) => /exclusion constraint|duplicate key/i.test(String(err?.message || ""));
 
 async function query(sql, parameters) {
   const res = await execWithResume(new ExecuteStatementCommand({
@@ -275,34 +277,72 @@ function zoneWord(timeZone) {
 }
 
 function availabilityLabel(rule) {
-  const days = String(rule.weekdays).split(",").map((day) => WEEKDAY_NAMES[Number(day)]).filter(Boolean);
-  const span = days.length > 1 ? `${days[0]} through ${days[days.length - 1]}` : days[0] || "those days";
-  return `${span}, ${clock(rule.work_start_minute)} to ${clock(rule.work_end_minute)} ${zoneWord(rule.timezone)}`;
+  const active = rule.rules;
+  if (!active.length) return `No hours are open right now (${zoneWord(rule.timezone)})`;
+  const names = active.map((day) => WEEKDAY_NAMES[day.weekday]);
+  const contiguous = active.every((day, index) => index === 0 || day.weekday === active[index - 1].weekday + 1);
+  const span = names.length === 1
+    ? names[0]
+    : contiguous ? `${names[0]} through ${names[names.length - 1]}` : names.join(", ");
+  const sameHours = active.every((day) => day.start_minute === active[0].start_minute && day.end_minute === active[0].end_minute);
+  const hours = sameHours ? `${clock(active[0].start_minute)} to ${clock(active[0].end_minute)}` : "hours vary by day";
+  return `${span}, ${hours} ${zoneWord(rule.timezone)}`;
 }
 
+// Availability lives in our own tables: one timezone and slot length, a weekly
+// rule per weekday, and blocked spans in UTC. Nothing here reads an external calendar.
 async function loadAvailability() {
-  const rows = await query(
-    "SELECT timezone, work_start_minute, work_end_minute, weekdays, slot_minutes FROM availability WHERE id = 1",
+  const settings = await query("SELECT timezone, slot_minutes, horizon_days FROM availability WHERE id = 1");
+  if (!settings.length) throw new Error("Availability is not configured.");
+  const rules = await query(
+    "SELECT weekday, start_minute, end_minute FROM availability_rules WHERE active ORDER BY weekday",
   );
-  if (!rows.length) throw new Error("Working hours are not configured.");
   return {
-    timezone: rows[0].timezone,
-    work_start_minute: Number(rows[0].work_start_minute),
-    work_end_minute: Number(rows[0].work_end_minute),
-    weekdays: rows[0].weekdays,
-    slot_minutes: Number(rows[0].slot_minutes || 60),
+    timezone: settings[0].timezone,
+    slot_minutes: Number(settings[0].slot_minutes || 60),
+    horizon_days: Number(settings[0].horizon_days || 28),
+    rules: rules.map((row) => ({
+      weekday: Number(row.weekday),
+      start_minute: Number(row.start_minute),
+      end_minute: Number(row.end_minute),
+    })),
   };
+}
+
+function ruleForWeekday(rule, weekday) {
+  return rule.rules.find((day) => day.weekday === weekday) || null;
 }
 
 function withinHours(start, end, rule) {
   const startParts = zoneParts(start, rule.timezone);
   const endParts = zoneParts(end, rule.timezone);
-  const allowed = new Set(String(rule.weekdays).split(",").map(Number));
-  return startParts.day === endParts.day
-    && allowed.has(startParts.weekday)
-    && startParts.minutes >= rule.work_start_minute
-    && endParts.minutes <= rule.work_end_minute
+  const day = ruleForWeekday(rule, startParts.weekday);
+  return Boolean(day)
+    && startParts.day === endParts.day
+    && startParts.minutes >= day.start_minute
+    && endParts.minutes <= day.end_minute
     && endParts.minutes > startParts.minutes;
+}
+
+async function blocksBetween(start, end) {
+  const rows = await query(
+    `SELECT id, starts_at, ends_at, reason FROM availability_blocks
+     WHERE starts_at < CAST(:end AS timestamptz) AND ends_at > CAST(:start AS timestamptz)
+     ORDER BY starts_at`,
+    [textParam("start", start.toISOString()), textParam("end", end.toISOString())],
+  );
+  return rows.map((row) => ({ ...row, start: parseDbTime(row.starts_at), end: parseDbTime(row.ends_at) }));
+}
+
+async function busyBetween(start, end) {
+  const rows = await query(
+    `SELECT s.id, s.starts_at, s.ends_at, s.status, c.name, c.email
+     FROM sessions s JOIN clients c ON c.id = s.client_id
+     WHERE s.status IN ('pending', 'approved', 'scheduled')
+       AND s.starts_at < CAST(:end AS timestamptz) AND s.ends_at > CAST(:start AS timestamptz)`,
+    [textParam("start", start.toISOString()), textParam("end", end.toISOString())],
+  );
+  return rows.map((row) => ({ ...row, start: parseDbTime(row.starts_at), end: parseDbTime(row.ends_at) }));
 }
 
 let calendarSecretCache;
@@ -342,17 +382,19 @@ async function googleAccessToken(secret) {
   return payload.access_token;
 }
 
+// Dormant until real provider credentials exist. Bookings work entirely from our
+// own tables; this only mirrors a confirmed session out once a provider is connected.
 async function syncCalendar(action, session, client, rule) {
   const secret = await loadCalendarSecret();
   if (!credentialsReady(secret)) {
-    return { status: "pending_credentials", eventId: session.google_event_id || null, error: null };
+    return { status: "none", eventId: session.external_event_id || null, error: null };
   }
   const token = await googleAccessToken(secret);
   const calendarId = encodeURIComponent(secret.calendar_id || "primary");
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
-  if (action === "update" && session.google_event_id) {
+  if (action === "update" && session.external_event_id) {
     const res = await fetch(
-      `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(session.google_event_id)}`,
+      `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(session.external_event_id)}`,
       {
         method: "PATCH",
         headers,
@@ -364,12 +406,12 @@ async function syncCalendar(action, session, client, rule) {
     );
     const payload = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(payload.error?.message || "Could not update the Google Calendar event");
-    return { status: "synced", eventId: session.google_event_id, error: null };
+    return { status: "synced", eventId: session.external_event_id, error: null };
   }
   if (action === "delete") {
-    if (!session.google_event_id) return { status: "cancelled", eventId: null, error: null };
+    if (!session.external_event_id) return { status: "cancelled", eventId: null, error: null };
     const res = await fetch(
-      `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(session.google_event_id)}`,
+      `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(session.external_event_id)}`,
       { method: "DELETE", headers },
     );
     if (!res.ok && res.status !== 410 && res.status !== 404) {
@@ -395,12 +437,13 @@ async function syncCalendar(action, session, client, rule) {
 async function writeCalendarResult(id, result) {
   const rows = await query(
     `UPDATE sessions
-     SET google_event_id = :eventId,
+     SET external_event_id = :eventId,
+         calendar_provider = CASE WHEN :eventId IS NULL THEN NULL ELSE 'google' END,
          calendar_sync_status = :status,
          calendar_sync_error = :error,
          updated_at = now()
      WHERE id = :id
-     RETURNING id, client_id, starts_at, ends_at, status, calendar_sync_status, google_event_id`,
+     RETURNING id, client_id, starts_at, ends_at, status, calendar_sync_status, external_event_id`,
     [
       textParam("eventId", result.eventId),
       textParam("status", result.status),
@@ -473,7 +516,7 @@ async function sendConfirmation(client, start, rule, token) {
   );
 }
 
-const SESSION_COLUMNS = "id, client_id, starts_at, ends_at, status, calendar_sync_status, google_event_id";
+const SESSION_COLUMNS = "id, client_id, starts_at, ends_at, status, calendar_sync_status, external_event_id";
 
 async function planSession(startsAt, durationMinutes, excludeId) {
   const duration = Number(durationMinutes);
@@ -486,6 +529,8 @@ async function planSession(startsAt, durationMinutes, excludeId) {
   if (!withinHours(start, end, rule)) {
     return { error: json(400, { ok: false, error: `Sessions are ${availabilityLabel(rule)}.` }) };
   }
+  const blocked = await blocksBetween(start, end);
+  if (blocked.length) return { error: json(409, { ok: false, error: "That time is blocked off." }) };
   const parameters = [textParam("ends", end.toISOString()), textParam("starts", start.toISOString())];
   let exclude = "";
   if (excludeId) {
@@ -494,7 +539,7 @@ async function planSession(startsAt, durationMinutes, excludeId) {
   }
   const overlap = await query(
     `SELECT id FROM sessions
-     WHERE status IN ('scheduled', 'requested', 'accepted') AND starts_at < CAST(:ends AS timestamptz) AND ends_at > CAST(:starts AS timestamptz)${exclude}
+     WHERE status IN ('pending', 'approved', 'scheduled') AND starts_at < CAST(:ends AS timestamptz) AND ends_at > CAST(:starts AS timestamptz)${exclude}
      LIMIT 1`,
     parameters,
   );
@@ -513,18 +558,24 @@ async function bookSession(body, user) {
   );
   if (!clients.length) return json(404, { ok: false, error: "Client not found." });
   const manageToken = crypto.randomBytes(24).toString("base64url");
-  const created = await query(
-    `INSERT INTO sessions (client_id, starts_at, ends_at, created_by, calendar_sync_status, manage_token)
-     VALUES (:clientId, CAST(:starts AS timestamptz), CAST(:ends AS timestamptz), :created_by, 'pending', :token)
-     RETURNING ${SESSION_COLUMNS}`,
-    [
-      longParam("clientId", body.clientId),
-      textParam("starts", start.toISOString()),
-      textParam("ends", end.toISOString()),
-      textParam("created_by", user.email),
-      textParam("token", manageToken),
-    ],
-  );
+  let created;
+  try {
+    created = await query(
+      `INSERT INTO sessions (client_id, starts_at, ends_at, status, created_by, calendar_sync_status, manage_token)
+       VALUES (:clientId, CAST(:starts AS timestamptz), CAST(:ends AS timestamptz), 'scheduled', :created_by, 'none', :token)
+       RETURNING ${SESSION_COLUMNS}`,
+      [
+        longParam("clientId", body.clientId),
+        textParam("starts", start.toISOString()),
+        textParam("ends", end.toISOString()),
+        textParam("created_by", user.email),
+        textParam("token", manageToken),
+      ],
+    );
+  } catch (err) {
+    if (isConflict(err)) return json(409, { ok: false, error: "That time was just taken." });
+    throw err;
+  }
   const mail = await sendConfirmation(clients[0], start, rule, manageToken);
   let session = created[0];
   try {
@@ -562,14 +613,14 @@ async function cancelSession(id) {
   let session = cancelled[0];
   try {
     const synced = await syncCalendar("delete", session, {}, rule);
-    session = await writeCalendarResult(session.id, synced.status === "pending_credentials"
-      ? { status: "pending_credentials", eventId: session.google_event_id, error: null }
+    session = await writeCalendarResult(session.id, synced.status === "none"
+      ? { status: "none", eventId: session.external_event_id, error: null }
       : synced);
   } catch (err) {
     console.error("Calendar delete failed:", err);
     session = await writeCalendarResult(session.id, {
       status: "error",
-      eventId: session.google_event_id,
+      eventId: session.external_event_id,
       error: "Google Calendar did not remove this session.",
     });
   }
@@ -578,7 +629,7 @@ async function cancelSession(id) {
 
 async function sessionByToken(token) {
   const rows = await query(
-    `SELECT s.id, s.client_id, s.starts_at, s.ends_at, s.status, s.manage_token, s.google_event_id, s.calendar_sync_status,
+    `SELECT s.id, s.client_id, s.starts_at, s.ends_at, s.status, s.manage_token, s.external_event_id, s.calendar_sync_status,
             c.name, c.email
      FROM sessions s JOIN clients c ON c.id = s.client_id
      WHERE s.manage_token = :token`,
@@ -618,31 +669,37 @@ async function manageSession(token, action, body) {
   }
   const plan = await planSession(body.startsAt, body.durationMinutes, row.id);
   if (plan.error) return plan.error;
-  const updated = await query(
-    `UPDATE sessions
-     SET starts_at = CAST(:starts AS timestamptz), ends_at = CAST(:ends AS timestamptz),
-         reminder_24h_sent_at = NULL, reminder_1h_sent_at = NULL, updated_at = now()
-     WHERE id = :id
-     RETURNING ${SESSION_COLUMNS}, manage_token`,
-    [
-      textParam("starts", plan.start.toISOString()),
-      textParam("ends", plan.end.toISOString()),
-      longParam("id", row.id),
-    ],
-  );
+  let updated;
+  try {
+    updated = await query(
+      `UPDATE sessions
+       SET starts_at = CAST(:starts AS timestamptz), ends_at = CAST(:ends AS timestamptz),
+           reminder_24h_sent_at = NULL, reminder_1h_sent_at = NULL, updated_at = now()
+       WHERE id = :id
+       RETURNING ${SESSION_COLUMNS}, manage_token`,
+      [
+        textParam("starts", plan.start.toISOString()),
+        textParam("ends", plan.end.toISOString()),
+        longParam("id", row.id),
+      ],
+    );
+  } catch (err) {
+    if (isConflict(err)) return json(409, { ok: false, error: "That time was just taken." });
+    throw err;
+  }
   try {
     const synced = await syncCalendar("update", {
       ...updated[0],
-      google_event_id: row.google_event_id,
+      external_event_id: row.external_event_id,
       starts_at: plan.start.toISOString(),
       ends_at: plan.end.toISOString(),
     }, row, plan.rule);
-    if (synced.status !== "pending_credentials") await writeCalendarResult(row.id, synced);
+    if (synced.status !== "none") await writeCalendarResult(row.id, synced);
   } catch (err) {
     console.error("Calendar update failed:", err);
     await writeCalendarResult(row.id, {
       status: "error",
-      eventId: row.google_event_id,
+      eventId: row.external_event_id,
       error: "Google Calendar did not accept the new time.",
     });
   }
@@ -792,48 +849,59 @@ function parseDbTime(value) {
 
 async function calendarDays(includePrivate) {
   const rule = await loadAvailability();
-  const slotMinutes = rule.slot_minutes || 60;
-  const horizon = new Date(Date.now() + 28 * 86400000).toISOString();
-  const busy = await query(
-    `SELECT s.id, s.starts_at, s.ends_at, s.status, c.name, c.email
-     FROM sessions s JOIN clients c ON c.id = s.client_id
-     WHERE s.status IN ('requested', 'accepted', 'scheduled')
-       AND s.ends_at > now()
-       AND s.starts_at < CAST(:horizon AS timestamptz)`,
-    [textParam("horizon", horizon)],
-  );
-  const taken = busy.map((row) => ({ ...row, start: parseDbTime(row.starts_at), end: parseDbTime(row.ends_at) }));
-  const allowed = new Set(String(rule.weekdays).split(",").map(Number));
-  const today = zoneParts(new Date(), rule.timezone).day;
+  const slotMinutes = rule.slot_minutes;
+  const now = new Date();
+  const horizonEnd = new Date(now.getTime() + (rule.horizon_days + 1) * 86400000);
+  const [busy, blocks] = await Promise.all([busyBetween(now, horizonEnd), blocksBetween(now, horizonEnd)]);
+  const today = zoneParts(now, rule.timezone).day;
   const days = [];
-  for (let offset = 0; offset < 28; offset += 1) {
+  for (let offset = 0; offset <= rule.horizon_days; offset += 1) {
     const day = addDays(today, offset);
     const noon = utcFromLocal(`${day}T12:00`, rule.timezone);
-    if (!noon || !allowed.has(zoneParts(noon, rule.timezone).weekday)) continue;
+    if (!noon) continue;
+    const dayRule = ruleForWeekday(rule, zoneParts(noon, rule.timezone).weekday);
+    if (!dayRule) continue;
     const slots = [];
-    for (let minute = rule.work_start_minute; minute + slotMinutes <= rule.work_end_minute; minute += slotMinutes) {
+    for (let minute = dayRule.start_minute; minute + slotMinutes <= dayRule.end_minute; minute += slotMinutes) {
       const local = `${day}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
       const start = utcFromLocal(local, rule.timezone);
-      if (!start || start.getTime() <= Date.now()) continue;
+      if (!start || start.getTime() <= now.getTime()) continue;
       const end = new Date(start.getTime() + slotMinutes * 60 * 1000);
-      const hit = taken.find((row) => row.start < end && row.end > start);
-      const slot = { startsAt: local, label: clock(minute), status: hit ? (includePrivate ? hit.status : "taken") : "open" };
-      if (hit && includePrivate) {
-        slot.sessionId = hit.id;
-        slot.name = hit.name;
-        slot.email = hit.email;
+      const block = blocks.find((row) => row.start < end && row.end > start);
+      const hit = busy.find((row) => row.start < end && row.end > start);
+      const slot = { startsAt: start.toISOString(), label: clock(minute) };
+      if (block) {
+        if (!includePrivate) continue;
+        slot.status = "blocked";
+        slot.blockId = block.id;
+        slot.reason = block.reason || null;
+      } else if (hit) {
+        slot.status = includePrivate ? hit.status : "taken";
+        if (includePrivate) {
+          slot.sessionId = hit.id;
+          slot.name = hit.name;
+          slot.email = hit.email;
+        }
+      } else {
+        slot.status = "available";
       }
       slots.push(slot);
     }
-    if (slots.length) {
-      days.push({
-        day,
-        label: new Intl.DateTimeFormat("en-US", { timeZone: rule.timezone, weekday: "long", month: "short", day: "numeric" }).format(noon),
-        slots,
-      });
-    }
+    if (!slots.length) continue;
+    if (!includePrivate && !slots.some((slot) => slot.status === "available")) continue;
+    days.push({
+      day,
+      label: new Intl.DateTimeFormat("en-US", { timeZone: rule.timezone, weekday: "long", month: "short", day: "numeric" }).format(noon),
+      slots,
+    });
   }
-  return { days, availabilityLabel: availabilityLabel(rule) };
+  return {
+    days,
+    timezone: rule.timezone,
+    timezoneLabel: `${zoneWord(rule.timezone)} Time`,
+    slotMinutes,
+    availabilityLabel: availabilityLabel(rule),
+  };
 }
 
 async function requestSlot(body) {
@@ -843,14 +911,22 @@ async function requestSlot(body) {
   if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return json(400, { ok: false, error: "Name and a valid email are required." });
   }
-  const rule = await loadAvailability();
-  const slot = rule.slot_minutes || 60;
-  const plan = await planSession(body.startsAt, slot);
-  if (plan.error) return plan.error;
-  const parts = zoneParts(plan.start, rule.timezone);
-  if ((parts.minutes - rule.work_start_minute) % slot !== 0) {
-    return json(400, { ok: false, error: "Choose one of the open hours." });
+  const start = new Date(String(body.startsAt || ""));
+  if (Number.isNaN(start.getTime()) || start.getMilliseconds() !== 0) {
+    return json(400, { ok: false, error: "Choose one of the available times." });
   }
+  const rule = await loadAvailability();
+  const slotMinutes = rule.slot_minutes;
+  const end = new Date(start.getTime() + slotMinutes * 60 * 1000);
+  const parts = zoneParts(start, rule.timezone);
+  const dayRule = ruleForWeekday(rule, parts.weekday);
+  const onGrid = Boolean(dayRule) && (parts.minutes - dayRule.start_minute) % slotMinutes === 0 && start.getUTCSeconds() === 0;
+  const tooLate = start.getTime() > Date.now() + (rule.horizon_days + 1) * 86400000;
+  if (!onGrid || !withinHours(start, end, rule) || start.getTime() <= Date.now() || tooLate) {
+    return json(400, { ok: false, error: "Choose one of the available times." });
+  }
+  const blocked = await blocksBetween(start, end);
+  if (blocked.length) return json(409, { ok: false, error: "That time is no longer available. Please choose another." });
   let clients = await query(
     "SELECT id, name, email FROM clients WHERE lower(email) = lower(:email) ORDER BY id DESC LIMIT 1",
     [textParam("email", email)],
@@ -864,28 +940,41 @@ async function requestSlot(body) {
     );
   }
   const manageToken = crypto.randomBytes(24).toString("base64url");
-  await query(
-    `INSERT INTO sessions (client_id, starts_at, ends_at, status, created_by, calendar_sync_status, manage_token)
-     VALUES (:clientId, CAST(:starts AS timestamptz), CAST(:ends AS timestamptz), 'requested', 'booking', 'pending', :token)`,
-    [
-      longParam("clientId", clients[0].id),
-      textParam("starts", plan.start.toISOString()),
-      textParam("ends", plan.end.toISOString()),
-      textParam("token", manageToken),
-    ],
-  );
-  const when = whenLabel(plan.start, rule);
+  try {
+    // The exclusion constraint on sessions rejects a second active booking for an
+    // overlapping span, so two visitors cannot both hold the same hour.
+    await query(
+      `INSERT INTO sessions (client_id, starts_at, ends_at, status, created_by, calendar_sync_status, manage_token)
+       VALUES (:clientId, CAST(:starts AS timestamptz), CAST(:ends AS timestamptz), 'pending', 'booking', 'none', :token)`,
+      [
+        longParam("clientId", clients[0].id),
+        textParam("starts", start.toISOString()),
+        textParam("ends", end.toISOString()),
+        textParam("token", manageToken),
+      ],
+    );
+  } catch (err) {
+    if (isConflict(err)) {
+      return json(409, { ok: false, error: "That time was just requested by someone else. Please choose another." });
+    }
+    throw err;
+  }
+  const when = whenLabel(start, rule);
   await sendMail(
     NOTIFY_ADDRESS,
-    `Session request from ${name}`,
-    `<div style="font-family:Arial,sans-serif;color:#111"><p><strong>${esc(name)}</strong> (${esc(email)}) asked for ${esc(when)}.</p><p>Accept or deny it in the admin calendar.</p></div>`,
+    `Phone call request from ${name}`,
+    `<div style="font-family:Arial,sans-serif;color:#111"><p><strong>${esc(name)}</strong> (${esc(email)}${phone ? `, ${esc(phone)}` : ""}) requested ${esc(when)}.</p><p>Approve or decline it in the admin calendar.</p></div>`,
   );
-  return json(200, { ok: true, notice: "Request sent. Rachel will accept or deny this hour." });
+  return json(200, {
+    ok: true,
+    request: { status: "pending", startsAt: start.toISOString(), when, timezone: rule.timezone },
+    notice: "Your request is pending. Rachel will review it and follow up by email to confirm.",
+  });
 }
 
 async function sessionWithClient(id) {
   const rows = await query(
-    `SELECT s.id, s.starts_at, s.ends_at, s.status, s.manage_token, s.google_event_id, c.name, c.email
+    `SELECT s.id, s.starts_at, s.ends_at, s.status, s.manage_token, s.external_event_id, c.name, c.email
      FROM sessions s JOIN clients c ON c.id = s.client_id
      WHERE s.id = :id`,
     [longParam("id", id)],
@@ -893,13 +982,13 @@ async function sessionWithClient(id) {
   return rows[0] || null;
 }
 
-async function acceptSession(id) {
+async function approveRequest(id) {
   const row = await sessionWithClient(id);
-  if (!row) return json(404, { ok: false, error: "Session not found." });
-  if (row.status !== "requested") return json(400, { ok: false, error: "This request was already handled." });
+  if (!row) return json(404, { ok: false, error: "Request not found." });
+  if (row.status !== "pending") return json(400, { ok: false, error: "This request was already handled." });
   const updated = await query(
-    `UPDATE sessions SET status = 'accepted', updated_at = now()
-     WHERE id = :id AND status = 'requested'
+    `UPDATE sessions SET status = 'approved', decided_at = now(), updated_at = now()
+     WHERE id = :id AND status = 'pending'
      RETURNING id`,
     [longParam("id", id)],
   );
@@ -916,13 +1005,13 @@ async function acceptSession(id) {
   return json(200, { ok: true, ...mail });
 }
 
-async function denySession(id) {
+async function declineRequest(id) {
   const row = await sessionWithClient(id);
-  if (!row) return json(404, { ok: false, error: "Session not found." });
-  if (row.status !== "requested") return json(400, { ok: false, error: "This request was already handled." });
+  if (!row) return json(404, { ok: false, error: "Request not found." });
+  if (row.status !== "pending") return json(400, { ok: false, error: "This request was already handled." });
   const updated = await query(
-    `UPDATE sessions SET status = 'denied', updated_at = now()
-     WHERE id = :id AND status = 'requested'
+    `UPDATE sessions SET status = 'declined', decided_at = now(), updated_at = now()
+     WHERE id = :id AND status = 'pending'
      RETURNING id`,
     [longParam("id", id)],
   );
@@ -937,6 +1026,85 @@ async function denySession(id) {
     </div>`,
   );
   return json(200, { ok: true, ...mail });
+}
+
+async function createBlock(body, user) {
+  const start = new Date(String(body.startsAt || ""));
+  const end = new Date(String(body.endsAt || ""));
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
+    return json(400, { ok: false, error: "Enter a valid start and end." });
+  }
+  const rows = await query(
+    `INSERT INTO availability_blocks (starts_at, ends_at, reason, created_by)
+     VALUES (CAST(:starts AS timestamptz), CAST(:ends AS timestamptz), :reason, :created_by)
+     RETURNING id, starts_at, ends_at, reason`,
+    [
+      textParam("starts", start.toISOString()),
+      textParam("ends", end.toISOString()),
+      textParam("reason", String(body.reason || "").trim().slice(0, 200)),
+      textParam("created_by", user.email),
+    ],
+  );
+  return json(200, { ok: true, block: rows[0] });
+}
+
+async function deleteBlock(id) {
+  const rows = await query("DELETE FROM availability_blocks WHERE id = :id RETURNING id", [longParam("id", id)]);
+  if (!rows.length) return json(400, { ok: false, error: "That block is already gone." });
+  return json(200, { ok: true });
+}
+
+async function availabilitySettings() {
+  const rule = await loadAvailability();
+  const rows = await query("SELECT weekday, start_minute, end_minute, active FROM availability_rules ORDER BY weekday");
+  const byDay = new Map(rows.map((row) => [Number(row.weekday), row]));
+  const rules = WEEKDAY_NAMES.map((name, weekday) => {
+    const row = byDay.get(weekday);
+    return {
+      weekday,
+      name,
+      active: row ? Boolean(row.active) : false,
+      start_minute: row ? Number(row.start_minute) : 540,
+      end_minute: row ? Number(row.end_minute) : 1020,
+    };
+  });
+  return json(200, {
+    ok: true,
+    timezone: rule.timezone,
+    timezoneLabel: `${zoneWord(rule.timezone)} Time`,
+    slotMinutes: rule.slot_minutes,
+    rules,
+    availabilityLabel: availabilityLabel(rule),
+  });
+}
+
+async function saveAvailabilityRules(body) {
+  const rules = Array.isArray(body.rules) ? body.rules : [];
+  for (const row of rules) {
+    const weekday = Number(row.weekday);
+    const startMinute = Number(row.start_minute);
+    const endMinute = Number(row.end_minute);
+    if (!Number.isInteger(weekday) || weekday < 0 || weekday > 6) return json(400, { ok: false, error: "Weekday is not valid." });
+    if (!Number.isInteger(startMinute) || !Number.isInteger(endMinute) || startMinute < 0 || endMinute > 1440 || endMinute <= startMinute) {
+      return json(400, { ok: false, error: `${WEEKDAY_NAMES[weekday]} needs an end time after its start time.` });
+    }
+  }
+  for (const row of rules) {
+    await query(
+      `INSERT INTO availability_rules (weekday, start_minute, end_minute, active)
+       VALUES (:weekday, :start, :end, :active)
+       ON CONFLICT (weekday) DO UPDATE
+         SET start_minute = EXCLUDED.start_minute, end_minute = EXCLUDED.end_minute,
+             active = EXCLUDED.active, updated_at = now()`,
+      [
+        longParam("weekday", row.weekday),
+        longParam("start", row.start_minute),
+        longParam("end", row.end_minute),
+        boolParam("active", row.active),
+      ],
+    );
+  }
+  return availabilitySettings();
 }
 
 export const handler = async (event) => {
@@ -980,7 +1148,7 @@ export const handler = async (event) => {
     }
   }
 
-  if (method === "GET" && path.endsWith("/availability")) {
+  if (method === "GET" && path.endsWith("/api/availability")) {
     try {
       return json(200, { ok: true, ...(await calendarDays(false)) });
     } catch (err) {
@@ -989,7 +1157,7 @@ export const handler = async (event) => {
     }
   }
 
-  if (method === "POST" && path.endsWith("/requests")) {
+  if (method === "POST" && path.endsWith("/api/requests")) {
     let body;
     try { body = JSON.parse(event.body || "{}"); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
     try {
@@ -1013,6 +1181,7 @@ export const handler = async (event) => {
   const sessionCancel = path.match(/\/sessions\/(\d+)\/cancel$/);
   const sessionAccept = path.match(/\/sessions\/(\d+)\/accept$/);
   const sessionDeny = path.match(/\/sessions\/(\d+)\/deny$/);
+  const blockMatch = path.match(/\/blocks\/(\d+)$/);
 
   try {
     if (method === "GET" && path.endsWith("/export")) return exportCsv();
@@ -1020,6 +1189,22 @@ export const handler = async (event) => {
     if (method === "GET" && path.endsWith("/calendar")) {
       return json(200, { ok: true, ...(await calendarDays(true)) });
     }
+
+    if (method === "GET" && path.endsWith("/admin/availability")) return availabilitySettings();
+
+    if (method === "PUT" && path.endsWith("/admin/availability")) {
+      let body;
+      try { body = JSON.parse(event.body || "{}"); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
+      return saveAvailabilityRules(body);
+    }
+
+    if (method === "POST" && path.endsWith("/blocks")) {
+      let body;
+      try { body = JSON.parse(event.body || "{}"); } catch { return json(400, { ok: false, error: "Invalid JSON" }); }
+      return createBlock(body, user);
+    }
+
+    if (method === "DELETE" && blockMatch) return deleteBlock(blockMatch[1]);
 
     if (method === "GET" && path.endsWith("/submissions")) {
       const rows = await query(`SELECT id, created_at, name, email, phone, location, experience,
@@ -1043,7 +1228,7 @@ export const handler = async (event) => {
       );
       const sessions = await query(
         `SELECT ${SESSION_COLUMNS}
-         FROM sessions WHERE client_id = :id AND status NOT IN ('cancelled', 'denied')
+         FROM sessions WHERE client_id = :id AND status NOT IN ('cancelled', 'declined')
          ORDER BY starts_at`,
         [longParam("id", id)],
       );
@@ -1125,9 +1310,9 @@ export const handler = async (event) => {
       return cancelSession(sessionCancel[1]);
     }
 
-    if (method === "POST" && sessionAccept) return acceptSession(sessionAccept[1]);
+    if (method === "POST" && sessionAccept) return approveRequest(sessionAccept[1]);
 
-    if (method === "POST" && sessionDeny) return denySession(sessionDeny[1]);
+    if (method === "POST" && sessionDeny) return declineRequest(sessionDeny[1]);
   } catch (err) {
     console.error("Admin request failed:", err);
     return json(500, { ok: false, error: "Request failed" });
